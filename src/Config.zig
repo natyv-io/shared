@@ -39,6 +39,16 @@ pub const WidgetsConfig = struct {
     label: bool = false,
 };
 
+pub const UiConfig = struct {
+    /// `null` (the default) means the app uses the plain, absolute-pixel
+    /// `natyv_create_*` widget functions and gets none of the
+    /// `natyv_clay_*` ones -- keeps bundles small for apps that don't need
+    /// layout, same enforcement story as every other capability here.
+    /// `"clay"` is the only recognized value today; `"yoga"` is reserved
+    /// for when that backend actually gets built (see project memory).
+    backend: ?[]const u8 = null,
+};
+
 /// Used both as the window title and as SDL_GetPrefPath's app-name
 /// namespace component for where per-app data (e.g. the sqlite file) gets
 /// written on disk.
@@ -49,6 +59,7 @@ app_wasm: []const u8,
 sqlite: SqliteConfig = .{},
 network: NetworkConfig = .{},
 widgets: WidgetsConfig = .{},
+ui: UiConfig = .{},
 
 /// Returns the owning `std.json.Parsed(Self)` -- caller must call
 /// `.deinit()` once done with `.value`. `.allocate = .alloc_always` is
@@ -78,6 +89,14 @@ test "defaults: unspecified sections stay disabled, name/filename fall back" {
     try std.testing.expect(!parsed.value.network.enabled);
     try std.testing.expectEqualStrings("data.sqlite3", parsed.value.sqlite.filename);
     try std.testing.expect(!parsed.value.widgets.button);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed.value.ui.backend);
+}
+
+test "ui.backend: clay opts an app into the natyv_clay_* host functions" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseBytes(allocator, "{\"app_wasm\":\"guest/app.wasm\",\"ui\":{\"backend\":\"clay\"}}");
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("clay", parsed.value.ui.backend.?);
 }
 
 test "app_wasm is required" {
