@@ -37,6 +37,9 @@ pub const WidgetsConfig = struct {
     button: bool = false,
     textfield: bool = false,
     label: bool = false,
+    checkbox: bool = false,
+    radio_button: bool = false,
+    progress_bar: bool = false,
 };
 
 pub const UiConfig = struct {
