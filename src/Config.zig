@@ -40,6 +40,7 @@ pub const WidgetsConfig = struct {
     checkbox: bool = false,
     radio_button: bool = false,
     progress_bar: bool = false,
+    slider: bool = false,
 };
 
 pub const UiConfig = struct {
