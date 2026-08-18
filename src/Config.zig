@@ -44,6 +44,7 @@ pub const WidgetsConfig = struct {
     progress_bar: bool = false,
     slider: bool = false,
     divider: bool = false,
+    badge: bool = false,
 };
 
 pub const UiConfig = struct {
