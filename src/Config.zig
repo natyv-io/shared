@@ -45,6 +45,8 @@ pub const WidgetsConfig = struct {
     slider: bool = false,
     divider: bool = false,
     badge: bool = false,
+    numeric_stepper: bool = false,
+    segmented_control: bool = false,
 };
 
 pub const UiConfig = struct {
