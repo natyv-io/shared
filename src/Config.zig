@@ -42,6 +42,7 @@ pub const WidgetsConfig = struct {
     radio_button: bool = false,
     progress_bar: bool = false,
     slider: bool = false,
+    divider: bool = false,
 };
 
 pub const UiConfig = struct {
