@@ -36,6 +36,7 @@ pub const NetworkConfig = struct {
 pub const WidgetsConfig = struct {
     button: bool = false,
     textfield: bool = false,
+    textarea: bool = false,
     label: bool = false,
     checkbox: bool = false,
     radio_button: bool = false,
