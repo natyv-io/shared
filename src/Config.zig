@@ -39,6 +39,7 @@ pub const WidgetsConfig = struct {
     textarea: bool = false,
     label: bool = false,
     checkbox: bool = false,
+    toggle: bool = false,
     radio_button: bool = false,
     progress_bar: bool = false,
     slider: bool = false,
