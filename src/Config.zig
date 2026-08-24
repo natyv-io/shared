@@ -66,6 +66,17 @@ name: []const u8 = "natyv-app",
 /// Path to the compiled guest module, resolved relative to this config
 /// file's own directory (not the process's cwd) -- see main.zig.
 app_wasm: []const u8,
+/// The command `natyv prepare`/`natyv build` run to compile this app's own
+/// guest source to wasm (e.g. `tinygo build -target wasip1
+/// -buildmode=c-shared -o clay-fixture.wasm .`) -- natyv never shells out
+/// to N different guest-language compilers itself (see CLAUDE.md's CLI
+/// build flow section), it only spawns whatever the dev already uses.
+/// Required, same reasoning as `app_wasm`: a real install shouldn't
+/// require remembering undocumented flags to build someone else's app
+/// correctly. Not yet invoked anywhere -- that's `.ntx` tooling Stage 7
+/// (~/.claude/plans/lexical-wishing-penguin.md); this field only exists
+/// and validates for now.
+wasm_compile: []const u8,
 sqlite: SqliteConfig = .{},
 network: NetworkConfig = .{},
 widgets: WidgetsConfig = .{},
@@ -91,7 +102,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.jso
 
 test "defaults: unspecified sections stay disabled, name/filename fall back" {
     const allocator = std.testing.allocator;
-    const parsed = try parseBytes(allocator, "{\"app_wasm\":\"guest/app.wasm\"}");
+    const parsed = try parseBytes(allocator, "{\"app_wasm\":\"guest/app.wasm\",\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
     defer parsed.deinit();
     try std.testing.expectEqualStrings("natyv-app", parsed.value.name);
     try std.testing.expectEqualStrings("guest/app.wasm", parsed.value.app_wasm);
@@ -104,14 +115,19 @@ test "defaults: unspecified sections stay disabled, name/filename fall back" {
 
 test "ui.backend: clay opts an app into the natyv_clay_* host functions" {
     const allocator = std.testing.allocator;
-    const parsed = try parseBytes(allocator, "{\"app_wasm\":\"guest/app.wasm\",\"ui\":{\"backend\":\"clay\"}}");
+    const parsed = try parseBytes(allocator, "{\"app_wasm\":\"guest/app.wasm\",\"wasm_compile\":\"tinygo build -o app.wasm .\",\"ui\":{\"backend\":\"clay\"}}");
     defer parsed.deinit();
     try std.testing.expectEqualStrings("clay", parsed.value.ui.backend.?);
 }
 
 test "app_wasm is required" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.MissingField, parseBytes(allocator, "{}"));
+    try std.testing.expectError(error.MissingField, parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}"));
+}
+
+test "wasm_compile is required" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.MissingField, parseBytes(allocator, "{\"app_wasm\":\"guest/app.wasm\"}"));
 }
 
 test "full config: every section populated" {
@@ -120,6 +136,7 @@ test "full config: every section populated" {
         \\{
         \\  "name": "bookstore",
         \\  "app_wasm": "guest/bookstore.wasm",
+        \\  "wasm_compile": "tinygo build -target wasip1 -buildmode=c-shared -o bookstore.wasm .",
         \\  "sqlite": {"enabled": true, "filename": "books.sqlite3"},
         \\  "network": {"enabled": true, "allowed_hosts": ["www.google.com"]},
         \\  "widgets": {"button": true, "textfield": true, "label": true}
