@@ -1,8 +1,20 @@
-//! Parses `conf.natyv.json` -- the per-app declaration of what it's called,
-//! where its wasm lives, and which capabilities it needs. Replaces the M5
-//! placeholder of passing `app.wasm`'s path and `allowed_hosts` as raw CLI
-//! arguments: a real install shouldn't require a developer to remember
-//! command-line flags to run someone else's app correctly.
+//! Parses `conf.natyv.json` -- the per-app declaration of what it's called
+//! and which capabilities it needs. Replaces the M5 placeholder of passing
+//! `app.wasm`'s path and `allowed_hosts` as raw CLI arguments: a real
+//! install shouldn't require a developer to remember command-line flags
+//! to run someone else's app correctly.
+//!
+//! **`app_wasm` was removed as a public field (2026-08-24, the confirmed
+//! `.ntx` tooling Stage 7 breaking change)** -- `natyv build` now always
+//! bundles the compiled wasm directly into the natyv-core binary via
+//! `@embedFile` (see `src/cli/Bundle.zig`/`build.zig`'s
+//! `-Dembed-app-wasm`), so a dev-configured runtime disk path is no
+//! longer the real mechanism. The underlying "read wasm bytes from a
+//! file" code survives in `main.zig` for local dev/testing (running
+//! natyv-core directly against an example without a full `natyv build`
+//! round trip) -- it now derives the filename from `name` via
+//! `wasmFilename` below (`<name>.wasm`, the same convention `app_wasm`
+//! always held in practice) instead of reading a separate config key.
 //!
 //! The shape here is a deliberate starting point, not a finished schema --
 //! expected to grow new capability sections over time (filesystem access,
@@ -61,26 +73,32 @@ pub const UiConfig = struct {
 
 /// Used both as the window title and as SDL_GetPrefPath's app-name
 /// namespace component for where per-app data (e.g. the sqlite file) gets
-/// written on disk.
+/// written on disk. Also what the compiled guest module's own filename
+/// is derived from -- see the note on `app_wasm` below.
 name: []const u8 = "natyv-app",
-/// Path to the compiled guest module, resolved relative to this config
-/// file's own directory (not the process's cwd) -- see main.zig.
-app_wasm: []const u8,
 /// The command `natyv prepare`/`natyv build` run to compile this app's own
 /// guest source to wasm (e.g. `tinygo build -target wasip1
 /// -buildmode=c-shared -o clay-fixture.wasm .`) -- natyv never shells out
 /// to N different guest-language compilers itself (see CLAUDE.md's CLI
 /// build flow section), it only spawns whatever the dev already uses.
-/// Required, same reasoning as `app_wasm`: a real install shouldn't
-/// require remembering undocumented flags to build someone else's app
-/// correctly. Not yet invoked anywhere -- that's `.ntx` tooling Stage 7
-/// (~/.claude/plans/lexical-wishing-penguin.md); this field only exists
-/// and validates for now.
+/// Required: a real install shouldn't require remembering undocumented
+/// flags to build someone else's app correctly.
 wasm_compile: []const u8,
 sqlite: SqliteConfig = .{},
 network: NetworkConfig = .{},
 widgets: WidgetsConfig = .{},
 ui: UiConfig = .{},
+
+/// The compiled guest module's real on-disk filename, derived from
+/// `name` -- `natyv prepare`/`natyv build` always compile to `<name>.wasm`
+/// (a real, already-consistent convention across every existing example
+/// even from back when `app_wasm` was still a distinct public field: its
+/// value was always exactly this). Lives under `guest/` alongside the
+/// rest of the guest source, resolved relative to the config file's own
+/// directory (not the process's cwd) -- see main.zig/cli/main.zig.
+pub fn wasmFilename(self: Self, allocator: std.mem.Allocator) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}.wasm", .{self.name});
+}
 
 /// Returns the owning `std.json.Parsed(Self)` -- caller must call
 /// `.deinit()` once done with `.value`. `.allocate = .alloc_always` is
@@ -102,10 +120,9 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.jso
 
 test "defaults: unspecified sections stay disabled, name/filename fall back" {
     const allocator = std.testing.allocator;
-    const parsed = try parseBytes(allocator, "{\"app_wasm\":\"guest/app.wasm\",\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    const parsed = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
     defer parsed.deinit();
     try std.testing.expectEqualStrings("natyv-app", parsed.value.name);
-    try std.testing.expectEqualStrings("guest/app.wasm", parsed.value.app_wasm);
     try std.testing.expect(!parsed.value.sqlite.enabled);
     try std.testing.expect(!parsed.value.network.enabled);
     try std.testing.expectEqualStrings("data.sqlite3", parsed.value.sqlite.filename);
@@ -115,19 +132,30 @@ test "defaults: unspecified sections stay disabled, name/filename fall back" {
 
 test "ui.backend: clay opts an app into the natyv_clay_* host functions" {
     const allocator = std.testing.allocator;
-    const parsed = try parseBytes(allocator, "{\"app_wasm\":\"guest/app.wasm\",\"wasm_compile\":\"tinygo build -o app.wasm .\",\"ui\":{\"backend\":\"clay\"}}");
+    const parsed = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\",\"ui\":{\"backend\":\"clay\"}}");
     defer parsed.deinit();
     try std.testing.expectEqualStrings("clay", parsed.value.ui.backend.?);
 }
 
-test "app_wasm is required" {
+test "app_wasm is no longer a recognized field -- silently ignored, not required" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.MissingField, parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}"));
+    const parsed = try parseBytes(allocator, "{\"app_wasm\":\"guest/app.wasm\",\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("natyv-app", parsed.value.name);
 }
 
 test "wasm_compile is required" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.MissingField, parseBytes(allocator, "{\"app_wasm\":\"guest/app.wasm\"}"));
+    try std.testing.expectError(error.MissingField, parseBytes(allocator, "{}"));
+}
+
+test "wasmFilename derives <name>.wasm" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseBytes(allocator, "{\"name\":\"bookstore\",\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer parsed.deinit();
+    const filename = try parsed.value.wasmFilename(allocator);
+    defer allocator.free(filename);
+    try std.testing.expectEqualStrings("bookstore.wasm", filename);
 }
 
 test "full config: every section populated" {
@@ -135,7 +163,6 @@ test "full config: every section populated" {
     const parsed = try parseBytes(allocator,
         \\{
         \\  "name": "bookstore",
-        \\  "app_wasm": "guest/bookstore.wasm",
         \\  "wasm_compile": "tinygo build -target wasip1 -buildmode=c-shared -o bookstore.wasm .",
         \\  "sqlite": {"enabled": true, "filename": "books.sqlite3"},
         \\  "network": {"enabled": true, "allowed_hosts": ["www.google.com"]},
