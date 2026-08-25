@@ -83,6 +83,13 @@ pub const BindingEntry = struct {
     /// still-open architecture question, the eventual per-app natyv-core
     /// rebuild) needs to actually resolve `header`.
     include_dirs: []const []const u8 = &.{},
+    /// Real `-L` library search paths -- needed for anything not on the
+    /// linker's default search path (e.g. a Homebrew keg-only library like
+    /// `zlib` itself). Added in Stage 2.4 once `pkg-config --libs` output
+    /// (which routinely includes these) needed somewhere to go -- `link`
+    /// only ever holds bare library names, matching `build.zig`'s
+    /// `linkSystemLibrary(name)` convention.
+    lib_dirs: []const []const u8 = &.{},
     /// Real linker flags needed to resolve the library's actual compiled
     /// implementation (e.g. `["z"]` for `-lz`) -- `header` only has
     /// declarations, not the real machine code.
