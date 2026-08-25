@@ -99,6 +99,28 @@ pub const BindingEntry = struct {
     /// comment on why blind enumeration over an arbitrary header is
     /// unsafe.
     functions: []const []const u8,
+    /// Non-null marks this a "zig package" entry (Stage 2.4's `-c` mode
+    /// vs. Stage 2.5's `-zig` mode are mutually exclusive per entry) --
+    /// the URL/path handed to `zig fetch --save=<library>`, both against
+    /// this app's own natyv-core rebuild (for the real final
+    /// `b.dependency(library, ...).artifact(zig_artifact)` +
+    /// `linkLibrary` step) and against a throwaway scratch project `natyv
+    /// bind` uses to discover the fetched package's real installed header
+    /// directory (confirmed empirically: `zig fetch --save=` is a real,
+    /// idempotent no-op when the same name+url is already present, so
+    /// re-running this on every `natyv bind` is safe). When set,
+    /// `include_dirs`/`lib_dirs`/`link` stay empty for this entry --
+    /// linking happens via the fetched package's own build.zig
+    /// (`linkLibrary` automatically propagates its installed headers too,
+    /// confirmed against this project's own real SDL3 usage in
+    /// `build.zig`/`src/c.zig`), not flags.
+    zig_url: ?[]const u8 = null,
+    /// Required alongside `zig_url` -- the exact `*Step.Compile` artifact
+    /// name the fetched package's own build.zig exposes (e.g. `"z"` for
+    /// `allyourcodebase/zlib`). No viable default guess exists for this
+    /// (unlike `header`'s `<library>.h` convention) -- real Zig-ecosystem
+    /// knowledge the dev must already have to consume the package at all.
+    zig_artifact: ?[]const u8 = null,
 };
 
 pub const UiConfig = struct {
