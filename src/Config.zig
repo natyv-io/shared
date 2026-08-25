@@ -121,6 +121,41 @@ pub const BindingEntry = struct {
     /// (unlike `header`'s `<library>.h` convention) -- real Zig-ecosystem
     /// knowledge the dev must already have to consume the package at all.
     zig_artifact: ?[]const u8 = null,
+    /// Non-null marks this a "locally vendored" entry (Stage 2.6's `-c=`
+    /// URL vendoring, mutually exclusive with `zig_url` -- a `-c=<url>`
+    /// vs `-zig=<url>` choice at `natyv get` time) -- the raw C source
+    /// URL/path handed to `zig fetch --save=<library>` (no build.zig
+    /// assumed at all, unlike `zig_url`; see `src/cli/Vendor.zig`'s own
+    /// doc comment for why `zig fetch` still works fine for a plain
+    /// source tarball with no Zig package structure). The object code
+    /// this produces becomes part of the same build directly, so
+    /// `include_dirs`/`lib_dirs`/`link` are used differently here than
+    /// elsewhere: `include_dirs` still gets the vendored source's own
+    /// directory appended (so its `.c` files' own local `#include`s
+    /// resolve) but `link`/`lib_dirs` normally stay empty unless the
+    /// vendored library itself needs an additional external system
+    /// library (rare, but not assumed impossible).
+    vendor_url: ?[]const u8 = null,
+    /// Tier 1 (the default, used when `vendor_c_build` is unset): real,
+    /// relative-to-the-vendored-source-root `.c` file paths to compile
+    /// directly -- computed once by `natyv get`'s own real fetch+walk (a
+    /// first-cut heuristic: every real `.c` file found, skipping any path
+    /// with a `test`/`tests`/`example`/`examples` component) and
+    /// persisted here so a dev can hand-curate it afterward, exactly
+    /// mirroring this project's own real, hand-pruned FreeType vendoring
+    /// in `build.zig` (a library whose optional features are gated by
+    /// build-time config knobs may need the same kind of manual pruning
+    /// to avoid pulling in an unwanted transitive dependency -- not
+    /// solved generically here either, matching that same precedent).
+    vendor_files: []const []const u8 = &.{},
+    /// Tier 2, opt-in (mirrors `wasm_compile`'s shape exactly): when set,
+    /// `natyv bind` runs this exact shell command inside the freshly-
+    /// fetched vendor source directory instead of compiling
+    /// `vendor_files` itself -- the dev is then responsible for
+    /// `include_dirs`/`lib_dirs`/`link` describing whatever that command
+    /// produced (interpreted relative to the vendor source root in this
+    /// mode, unlike every other mode's cwd-relative-or-absolute paths).
+    vendor_c_build: ?[]const u8 = null,
 };
 
 pub const UiConfig = struct {
