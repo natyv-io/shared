@@ -61,6 +61,39 @@ pub const WidgetsConfig = struct {
     segmented_control: bool = false,
 };
 
+/// One C library `natyv bind` should generate Extism host-function
+/// trampolines + guest-wrapper code for -- Stage 2.1 of
+/// ~/.claude/plans/lexical-wishing-penguin.md. Written/updated by `natyv
+/// get` (not built yet); consumed by `natyv bind` (`src/cli/Bind.zig`).
+/// Only the "externally linked" mode for now (a library that's already
+/// compiled somewhere `link` can resolve) -- a second "locally vendored"
+/// mode (a list of `.c` sources `natyv bind` compiles directly, no `link`
+/// needed) is a real, still-open future field set, not added until a real
+/// vendoring case actually needs it.
+pub const BindingEntry = struct {
+    /// Names this entry -- drives the generated Zig handle-table/native-
+    /// callback variable names and the generated Go package name (see
+    /// `src/bindgen/Codegen.zig`'s own doc comment on why these can't be
+    /// hardcoded once more than one library can be bound).
+    library: []const u8,
+    /// The exact string handed to `@cInclude` when `natyv bind` generates
+    /// this entry's scratch reflector program.
+    header: []const u8,
+    /// Real `-I` include paths the reflector (and, per Stage 1's own
+    /// still-open architecture question, the eventual per-app natyv-core
+    /// rebuild) needs to actually resolve `header`.
+    include_dirs: []const []const u8 = &.{},
+    /// Real linker flags needed to resolve the library's actual compiled
+    /// implementation (e.g. `["z"]` for `-lz`) -- `header` only has
+    /// declarations, not the real machine code.
+    link: []const []const u8 = &.{},
+    /// The explicit allowlist of exact C function names to bind -- never
+    /// inferred/enumerated, see `src/bindgen/Reflect.zig`'s own doc
+    /// comment on why blind enumeration over an arbitrary header is
+    /// unsafe.
+    functions: []const []const u8,
+};
+
 pub const UiConfig = struct {
     /// `null` (the default) means the app uses the plain, absolute-pixel
     /// `natyv_create_*` widget functions and gets none of the
@@ -88,6 +121,9 @@ sqlite: SqliteConfig = .{},
 network: NetworkConfig = .{},
 widgets: WidgetsConfig = .{},
 ui: UiConfig = .{},
+/// Libraries `natyv bind` generates C bindings for -- see `BindingEntry`'s
+/// own doc comment. Empty (the default) means no bindings for this app.
+bindings: []const BindingEntry = &.{},
 
 /// The compiled guest module's real on-disk filename, derived from
 /// `name` -- `natyv prepare`/`natyv build` always compile to `<name>.wasm`
@@ -156,6 +192,33 @@ test "wasmFilename derives <name>.wasm" {
     const filename = try parsed.value.wasmFilename(allocator);
     defer allocator.free(filename);
     try std.testing.expectEqualStrings("bookstore.wasm", filename);
+}
+
+test "bindings: defaults to empty, a real entry parses with all its own fields" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.bindings.len);
+
+    const with_binding = try parseBytes(allocator,
+        \\{
+        \\  "wasm_compile": "tinygo build -o app.wasm .",
+        \\  "bindings": [
+        \\    { "library": "fixture", "header": "fixture.h",
+        \\      "include_dirs": ["fixtures/bindgen"], "link": [],
+        \\      "functions": ["fixture_create", "fixture_destroy"] }
+        \\  ]
+        \\}
+    );
+    defer with_binding.deinit();
+    try std.testing.expectEqual(@as(usize, 1), with_binding.value.bindings.len);
+    const entry = with_binding.value.bindings[0];
+    try std.testing.expectEqualStrings("fixture", entry.library);
+    try std.testing.expectEqualStrings("fixture.h", entry.header);
+    try std.testing.expectEqual(@as(usize, 1), entry.include_dirs.len);
+    try std.testing.expectEqualStrings("fixtures/bindgen", entry.include_dirs[0]);
+    try std.testing.expectEqual(@as(usize, 2), entry.functions.len);
+    try std.testing.expectEqualStrings("fixture_create", entry.functions[0]);
 }
 
 test "full config: every section populated" {
