@@ -45,6 +45,14 @@ pub const NetworkConfig = struct {
     allowed_hosts: []const []const u8 = &.{},
 };
 
+/// Same posture as SqliteConfig/NetworkConfig -- a `texture` fill in the
+/// stylesheet is a real error at `natyv prepare` time unless this is
+/// explicitly enabled, matching the styling system's own "closed
+/// vocabulary, clear errors" convention rather than silently ignoring it.
+pub const ImagesConfig = struct {
+    enabled: bool = false,
+};
+
 pub const WidgetsConfig = struct {
     button: bool = false,
     textfield: bool = false,
@@ -183,6 +191,7 @@ name: []const u8 = "natyv-app",
 wasm_compile: []const u8,
 sqlite: SqliteConfig = .{},
 network: NetworkConfig = .{},
+images: ImagesConfig = .{},
 widgets: WidgetsConfig = .{},
 ui: UiConfig = .{},
 /// Libraries `natyv bind` generates C bindings for -- see `BindingEntry`'s
