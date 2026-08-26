@@ -197,6 +197,24 @@ ui: UiConfig = .{},
 /// Libraries `natyv bind` generates C bindings for -- see `BindingEntry`'s
 /// own doc comment. Empty (the default) means no bindings for this app.
 bindings: []const BindingEntry = &.{},
+/// Real macOS `.app` bundle identifier (`CFBundleIdentifier`, e.g.
+/// `"com.example.myapp"`) -- Apple's own tooling expects a real
+/// reverse-DNS-shaped value, but there's no way to derive one from `name`
+/// alone the way `CFBundleName`/the window title/the wasm filename all
+/// already are. `null` (the default) synthesizes `dev.natyv.<name>` at
+/// bundle time (`effectiveBundleId` below) -- good enough to build/run/
+/// debug locally; a dev planning to actually distribute/notarize the app
+/// should set a real one they own.
+bundle_id: ?[]const u8 = null,
+/// Path to a single high-resolution (1024x1024 recommended) PNG, relative
+/// to this config file's own directory -- `natyv build` generates the
+/// full macOS `.iconset` (every required size) from it via `sips`, then
+/// packs a real `.icns` via `iconutil` (see `Bundle.zig`). `null` (the
+/// default) means the bundled app gets macOS's own generic app icon
+/// rather than a custom one. Deliberately not gated behind a capability
+/// flag the way `images`/texture-fill is -- this is build-time bundling
+/// metadata, not a runtime host feature.
+icon: ?[]const u8 = null,
 
 /// The compiled guest module's real on-disk filename, derived from
 /// `name` -- `natyv prepare`/`natyv build` always compile to `<name>.wasm`
@@ -207,6 +225,15 @@ bindings: []const BindingEntry = &.{},
 /// directory (not the process's cwd) -- see main.zig/cli/main.zig.
 pub fn wasmFilename(self: Self, allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}.wasm", .{self.name});
+}
+
+/// `bundle_id` if the dev set one, otherwise a synthesized
+/// `dev.natyv.<name>` default -- see `bundle_id`'s own doc comment.
+/// Always returns a freshly allocated string either way, so callers have
+/// one consistent ownership story regardless of which branch was taken.
+pub fn effectiveBundleId(self: Self, allocator: std.mem.Allocator) ![]u8 {
+    if (self.bundle_id) |id| return allocator.dupe(u8, id);
+    return std.fmt.allocPrint(allocator, "dev.natyv.{s}", .{self.name});
 }
 
 /// Returns the owning `std.json.Parsed(Self)` -- caller must call
@@ -265,6 +292,38 @@ test "wasmFilename derives <name>.wasm" {
     const filename = try parsed.value.wasmFilename(allocator);
     defer allocator.free(filename);
     try std.testing.expectEqualStrings("bookstore.wasm", filename);
+}
+
+test "bundle_id/icon: default to null, a real value round-trips" {
+    const allocator = std.testing.allocator;
+    const defaults = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer defaults.deinit();
+    try std.testing.expect(defaults.value.bundle_id == null);
+    try std.testing.expect(defaults.value.icon == null);
+
+    const with_both = try parseBytes(allocator,
+        \\{"wasm_compile":"tinygo build -o app.wasm .","bundle_id":"com.example.myapp","icon":"icon.png"}
+    );
+    defer with_both.deinit();
+    try std.testing.expectEqualStrings("com.example.myapp", with_both.value.bundle_id.?);
+    try std.testing.expectEqualStrings("icon.png", with_both.value.icon.?);
+}
+
+test "effectiveBundleId: synthesizes dev.natyv.<name> when unset, uses the real value otherwise" {
+    const allocator = std.testing.allocator;
+    const defaults = try parseBytes(allocator, "{\"name\":\"bookstore\",\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer defaults.deinit();
+    const synthesized = try defaults.value.effectiveBundleId(allocator);
+    defer allocator.free(synthesized);
+    try std.testing.expectEqualStrings("dev.natyv.bookstore", synthesized);
+
+    const explicit = try parseBytes(allocator,
+        \\{"name":"bookstore","wasm_compile":"tinygo build -o app.wasm .","bundle_id":"com.example.bookstore"}
+    );
+    defer explicit.deinit();
+    const real = try explicit.value.effectiveBundleId(allocator);
+    defer allocator.free(real);
+    try std.testing.expectEqualStrings("com.example.bookstore", real);
 }
 
 test "bindings: defaults to empty, a real entry parses with all its own fields" {
