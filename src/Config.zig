@@ -199,6 +199,29 @@ bundle_id: ?[]const u8 = null,
 /// metadata, not a runtime host feature.
 icon: ?[]const u8 = null,
 
+/// Which OSes `natyv build` produces real binaries for, using natyv's own
+/// friendly target names (see `cli/CompileTargets.zig`), not raw Zig
+/// target triples -- hides an implementation detail (e.g. `windows-gnu`
+/// vs `windows-msvc`) devs shouldn't need to know, and lets natyv remap
+/// the underlying triple later without breaking existing configs.
+/// Empty (the default) means "build for whatever OS `natyv build` itself
+/// is running on," exactly today's existing behavior -- unchanged for any
+/// app that never sets this. Only names natyv has actually verified
+/// *running* (not just compiling) are accepted -- see
+/// `CompileTargets.resolve`'s own doc comment for which those are today.
+compile_targets: []const []const u8 = &.{},
+
+/// Only meaningful when `compile_targets` includes a Linux target.
+/// `"appimage"` wraps the built binary into a real, distributable
+/// `.AppImage` (see `cli/PackageAppImage.zig` and the
+/// `natyv-linux-appimage-packaging` memory for the full design/proof).
+/// `null` (the default) ships the plain flat ELF binary, matching
+/// today's existing behavior -- deliberately opt-in rather than
+/// automatic, since a real AppImage is a meaningfully heavier artifact
+/// (a real runtime binary gets concatenated on) that a dev doing quick
+/// local iteration usually doesn't want on every single build.
+linux_package: ?[]const u8 = null,
+
 /// The compiled guest module's real on-disk filename, derived from
 /// `name` -- `natyv prepare`/`natyv build` always compile to `<name>.wasm`
 /// (a real, already-consistent convention across every existing example
@@ -359,4 +382,21 @@ test "widgets is no longer a recognized field -- silently ignored, every widget 
     const parsed = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\",\"widgets\":{\"button\":false,\"label\":false}}");
     defer parsed.deinit();
     try std.testing.expectEqualStrings("natyv-app", parsed.value.name);
+}
+
+test "compile_targets/linux_package: default to empty/null, an explicit value round-trips" {
+    const allocator = std.testing.allocator;
+    const defaults = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(usize, 0), defaults.value.compile_targets.len);
+    try std.testing.expect(defaults.value.linux_package == null);
+
+    const with_both = try parseBytes(allocator,
+        \\{"wasm_compile":"tinygo build -o app.wasm .","compile_targets":["macos-arm64","linux-arm64"],"linux_package":"appimage"}
+    );
+    defer with_both.deinit();
+    try std.testing.expectEqual(@as(usize, 2), with_both.value.compile_targets.len);
+    try std.testing.expectEqualStrings("macos-arm64", with_both.value.compile_targets[0]);
+    try std.testing.expectEqualStrings("linux-arm64", with_both.value.compile_targets[1]);
+    try std.testing.expectEqualStrings("appimage", with_both.value.linux_package.?);
 }
