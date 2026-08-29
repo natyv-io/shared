@@ -53,22 +53,6 @@ pub const ImagesConfig = struct {
     enabled: bool = false,
 };
 
-pub const WidgetsConfig = struct {
-    button: bool = false,
-    textfield: bool = false,
-    textarea: bool = false,
-    label: bool = false,
-    checkbox: bool = false,
-    toggle: bool = false,
-    radio_button: bool = false,
-    progress_bar: bool = false,
-    slider: bool = false,
-    divider: bool = false,
-    badge: bool = false,
-    numeric_stepper: bool = false,
-    segmented_control: bool = false,
-};
-
 /// One C library `natyv bind` should generate Extism host-function
 /// trampolines + guest-wrapper code for -- Stage 2.1 of
 /// ~/.claude/plans/lexical-wishing-penguin.md. Written/updated by `natyv
@@ -192,7 +176,6 @@ wasm_compile: []const u8,
 sqlite: SqliteConfig = .{},
 network: NetworkConfig = .{},
 images: ImagesConfig = .{},
-widgets: WidgetsConfig = .{},
 ui: UiConfig = .{},
 /// Libraries `natyv bind` generates C bindings for -- see `BindingEntry`'s
 /// own doc comment. Empty (the default) means no bindings for this app.
@@ -262,7 +245,6 @@ test "defaults: unspecified sections stay disabled, name/filename fall back" {
     try std.testing.expect(!parsed.value.sqlite.enabled);
     try std.testing.expect(!parsed.value.network.enabled);
     try std.testing.expectEqualStrings("data.sqlite3", parsed.value.sqlite.filename);
-    try std.testing.expect(!parsed.value.widgets.button);
     try std.testing.expectEqual(@as(?[]const u8, null), parsed.value.ui.backend);
 }
 
@@ -360,8 +342,7 @@ test "full config: every section populated" {
         \\  "name": "bookstore",
         \\  "wasm_compile": "tinygo build -target wasip1 -buildmode=c-shared -o bookstore.wasm .",
         \\  "sqlite": {"enabled": true, "filename": "books.sqlite3"},
-        \\  "network": {"enabled": true, "allowed_hosts": ["www.google.com"]},
-        \\  "widgets": {"button": true, "textfield": true, "label": true}
+        \\  "network": {"enabled": true, "allowed_hosts": ["www.google.com"]}
         \\}
     );
     defer parsed.deinit();
@@ -371,5 +352,11 @@ test "full config: every section populated" {
     try std.testing.expect(parsed.value.network.enabled);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.network.allowed_hosts.len);
     try std.testing.expectEqualStrings("www.google.com", parsed.value.network.allowed_hosts[0]);
-    try std.testing.expect(parsed.value.widgets.button and parsed.value.widgets.textfield and parsed.value.widgets.label);
+}
+
+test "widgets is no longer a recognized field -- silently ignored, every widget kind just works" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\",\"widgets\":{\"button\":false,\"label\":false}}");
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("natyv-app", parsed.value.name);
 }
