@@ -34,15 +34,66 @@ pub const SqliteConfig = struct {
     filename: []const u8 = "data.sqlite3",
 };
 
-pub const NetworkConfig = struct {
-    enabled: bool = false,
+pub const HttpConfig = struct {
     /// Exactly which hosts the guest may reach over HTTP -- the real
     /// security boundary, enforced by Extism's manifest `allowed_hosts`.
     /// Wildcards are supported by that schema. Ignored (treated as no
-    /// hosts allowed) if `enabled` is false, regardless of this list --
-    /// so flipping `enabled` off is always the fail-safe way to cut
-    /// network access entirely, not just an unenforced hint.
+    /// hosts allowed) if `network.enabled` is false, regardless of this
+    /// list -- so flipping `enabled` off is always the fail-safe way to
+    /// cut network access entirely, not just an unenforced hint.
     allowed_hosts: []const []const u8 = &.{},
+};
+
+/// How a `tcp.allowed_sockets` entry's connection is secured. Chosen by the
+/// dev per endpoint, never by the guest at `tcp_connect` time -- a guest
+/// can't request a looser mode than the one configured here. `.implicit`
+/// handshakes TLS immediately on connect (e.g. IMAPS on 993); `.starttls`
+/// connects plaintext and only upgrades once the guest explicitly asks
+/// (e.g. SMTP submission on 587, after the guest itself sends `STARTTLS`
+/// and reads the server's plaintext OK); `.none` never upgrades at all.
+pub const TlsMode = enum {
+    none,
+    implicit,
+    starttls,
+};
+
+/// One endpoint a guest may open a raw TCP socket to -- see
+/// `natyv-tcp-tls-host-function` memory for the full design. Real
+/// enforcement happens at `tcp_connect` time: any host:port the guest
+/// requests that isn't an exact match here is rejected.
+pub const AllowedSocket = struct {
+    host: []const u8,
+    port: u16,
+    tls: TlsMode = .none,
+    /// How long `tcp_connect` waits before giving up on this endpoint
+    /// specifically, overriding the built-in default
+    /// (`capabilities/Tcp.zig`'s `connect_timeout_secs`) -- e.g. a slower
+    /// legacy server might need more than the default allows. `null` (the
+    /// default) means "use the built-in default."
+    timeout_secs: ?i64 = null,
+    /// Path to a PEM file (relative to this config file's own directory,
+    /// same convention as `icon`), trusted as the *only* CA for this one
+    /// endpoint instead of the bundled Mozilla CA store (`Tls.zig`'s own
+    /// default) -- for a dev's private/internal CA or self-hosted server.
+    /// Replaces the default trust set for this endpoint entirely rather
+    /// than adding to it, so a locked-down private connection doesn't also
+    /// stay implicitly trusting every public CA. `null` (the default) uses
+    /// the bundled store. Staged and embedded at real `natyv build` time
+    /// (see `natyv-tcp-tls-host-function` memory) -- resolved from a live
+    /// disk read only in local dev iteration (`natyv build` not yet run).
+    ca_cert_path: ?[]const u8 = null,
+};
+
+pub const TcpConfig = struct {
+    /// Ignored (treated as no sockets allowed) if `network.enabled` is
+    /// false, same fail-safe posture as `HttpConfig.allowed_hosts`.
+    allowed_sockets: []const AllowedSocket = &.{},
+};
+
+pub const NetworkConfig = struct {
+    enabled: bool = false,
+    http: HttpConfig = .{},
+    tcp: TcpConfig = .{},
 };
 
 /// Same posture as SqliteConfig/NetworkConfig -- a `texture` fill in the
@@ -365,7 +416,11 @@ test "full config: every section populated" {
         \\  "name": "bookstore",
         \\  "wasm_compile": "tinygo build -target wasip1 -buildmode=c-shared -o bookstore.wasm .",
         \\  "sqlite": {"enabled": true, "filename": "books.sqlite3"},
-        \\  "network": {"enabled": true, "allowed_hosts": ["www.google.com"]}
+        \\  "network": {
+        \\    "enabled": true,
+        \\    "http": {"allowed_hosts": ["www.google.com"]},
+        \\    "tcp": {"allowed_sockets": [{"host": "imap.gmail.com", "port": 993, "tls": "implicit"}]}
+        \\  }
         \\}
     );
     defer parsed.deinit();
@@ -373,8 +428,55 @@ test "full config: every section populated" {
     try std.testing.expect(parsed.value.sqlite.enabled);
     try std.testing.expectEqualStrings("books.sqlite3", parsed.value.sqlite.filename);
     try std.testing.expect(parsed.value.network.enabled);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.network.allowed_hosts.len);
-    try std.testing.expectEqualStrings("www.google.com", parsed.value.network.allowed_hosts[0]);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.network.http.allowed_hosts.len);
+    try std.testing.expectEqualStrings("www.google.com", parsed.value.network.http.allowed_hosts[0]);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.network.tcp.allowed_sockets.len);
+    const socket = parsed.value.network.tcp.allowed_sockets[0];
+    try std.testing.expectEqualStrings("imap.gmail.com", socket.host);
+    try std.testing.expectEqual(@as(u16, 993), socket.port);
+    try std.testing.expectEqual(TlsMode.implicit, socket.tls);
+}
+
+test "tcp.allowed_sockets: defaults to empty, tls mode defaults to none" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseBytes(allocator,
+        \\{"wasm_compile":"tinygo build -o app.wasm .","network":{"enabled":true,"tcp":{"allowed_sockets":[{"host":"smtp.gmail.com","port":587,"tls":"starttls"},{"host":"example.com","port":80}]}}}
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.network.tcp.allowed_sockets.len);
+    try std.testing.expectEqual(TlsMode.starttls, parsed.value.network.tcp.allowed_sockets[0].tls);
+    try std.testing.expectEqual(TlsMode.none, parsed.value.network.tcp.allowed_sockets[1].tls);
+
+    const defaults = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(usize, 0), defaults.value.network.tcp.allowed_sockets.len);
+    try std.testing.expectEqual(@as(usize, 0), defaults.value.network.http.allowed_hosts.len);
+}
+
+test "tcp.allowed_sockets: timeout_secs defaults to null, an explicit per-endpoint override round-trips" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseBytes(allocator,
+        \\{"wasm_compile":"tinygo build -o app.wasm .","network":{"enabled":true,"tcp":{"allowed_sockets":[
+        \\  {"host":"slow.example.com","port":993,"tls":"implicit","timeout_secs":30},
+        \\  {"host":"imap.gmail.com","port":993,"tls":"implicit"}
+        \\]}}}
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?i64, 30), parsed.value.network.tcp.allowed_sockets[0].timeout_secs);
+    try std.testing.expectEqual(@as(?i64, null), parsed.value.network.tcp.allowed_sockets[1].timeout_secs);
+}
+
+test "tcp.allowed_sockets: ca_cert_path defaults to null, an explicit path round-trips" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseBytes(allocator,
+        \\{"wasm_compile":"tinygo build -o app.wasm .","network":{"enabled":true,"tcp":{"allowed_sockets":[
+        \\  {"host":"internal.example.com","port":993,"tls":"implicit","ca_cert_path":"certs/internal-ca.pem"},
+        \\  {"host":"imap.gmail.com","port":993,"tls":"implicit"}
+        \\]}}}
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("certs/internal-ca.pem", parsed.value.network.tcp.allowed_sockets[0].ca_cert_path.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed.value.network.tcp.allowed_sockets[1].ca_cert_path);
 }
 
 test "widgets is no longer a recognized field -- silently ignored, every widget kind just works" {
