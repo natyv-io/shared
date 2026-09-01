@@ -221,6 +221,15 @@ pub const SourceMappingKind = enum {
     string_literal,
     child_text,
     component_call,
+    /// `text={expr}` (2026-09-01) -- a Label/Button's dynamic child text,
+    /// an alternative to literal child content for a runtime-computed
+    /// value (e.g. `text={msg.From}`). Distinct from `.child_text`: that
+    /// kind's generated-side span is always a quoted Go string literal
+    /// (`writeGoStringLiteral`'s own escaping), this kind's generated-side
+    /// span is the raw, unquoted expression pasted verbatim -- same
+    /// "opaque host-language text" posture `.event_handler` already has,
+    /// just not a click handler.
+    dynamic_text,
 };
 
 pub const SourceMapping = struct {
@@ -405,6 +414,78 @@ const Emitter = struct {
             }
         }
         return null;
+    }
+
+    /// `text={expr}` (2026-09-01): a Label/Button's dynamic child text --
+    /// an alternative to literal child content for a runtime-computed
+    /// value, e.g. `text={msg.From}`. Accepts a braced expression (the
+    /// common case, emitted unquoted -- real host-language text pasted
+    /// verbatim) or a plain string literal (redundant with writing the
+    /// same text as a literal child, but harmless, so not rejected).
+    /// Returns `null` if absent; errors on any other braced shape (`ref`/
+    /// `styles`), same "clear codegen error" posture as every other
+    /// rejected attribute shape in this file.
+    const TextAttr = struct { expr: []const u8, quoted: bool, line: u32, col: u32 };
+
+    fn textAttr(self: *Emitter, el: Parser.Element) EmitError!?TextAttr {
+        for (el.attrs) |attr| {
+            if (!std.mem.eql(u8, attr.name, "text")) continue;
+            return switch (attr.value) {
+                .string_literal => |s| .{ .expr = s, .quoted = true, .line = attr.line, .col = attr.col },
+                .expr => |e| .{ .expr = e.expr, .quoted = false, .line = e.line, .col = e.col },
+                else => self.fail(attr.line, attr.col, "'text' must be a plain string or a braced expression, e.g. text=\"...\" or text={{expr}}", .{}),
+            };
+        }
+        return null;
+    }
+
+    /// Shared by Label/Button's own branches in `emitElement`: resolves
+    /// which of `text={expr}` or literal child content actually supplies
+    /// the widget's text, erroring if both are present (ambiguous -- pick
+    /// one) and emitting whichever won directly into `self.out` at the
+    /// current position, recording the right `SourceMapping` kind for
+    /// whichever source it came from. Returns nothing -- callers don't
+    /// need the resolved text itself, only its emission as a side effect,
+    /// since neither Label nor Button do anything else with it.
+    fn emitWidgetText(self: *Emitter, el: Parser.Element) EmitError!void {
+        const text_child = try self.childText(el);
+        const text_attr = try self.textAttr(el);
+        if (text_attr != null and text_child != null) {
+            return self.fail(el.line, el.col, "<{s}> can't have both a 'text' attribute and literal child text -- pick one", .{el.tag});
+        }
+
+        if (text_attr) |ta| {
+            const gen_start = self.out.items.len;
+            if (ta.quoted) {
+                try writeGoStringLiteral(self.out, self.allocator, ta.expr);
+            } else {
+                try self.out.appendSlice(self.allocator, ta.expr);
+            }
+            const gen_end = self.out.items.len;
+            const abs = translatePosition(self.body_line, self.body_col, ta.line, ta.col);
+            try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(ta.expr.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .dynamic_text });
+            return;
+        }
+
+        const text = if (text_child) |t| t.text else "";
+        const gen_start = self.out.items.len;
+        try writeGoStringLiteral(self.out, self.allocator, text);
+        const gen_end = self.out.items.len;
+        if (text_child) |t| {
+            const abs = translatePosition(self.body_line, self.body_col, t.line, t.col);
+            try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(t.text.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .child_text });
+            // Deliberately no semantic token here (unlike style-token
+            // names) -- child text is a widget's own real, author-facing
+            // label, not string-literal *syntax* from the `.ntx` author's
+            // perspective, and coloring it like a string (Quinn's own
+            // click-through, 2026-08-26: rendered as an off-putting
+            // orange) obscured rather than clarified that it's plain
+            // text. Leaving it untokenized renders it in the editor's own
+            // default foreground color instead. `text={expr}` gets no
+            // semantic token either, same "let the editor's native Go
+            // support color a real expression" posture `onClick={...}`
+            // already has.
+        }
     }
 
     fn emitApplyStyle(self: *Emitter, var_name: []const u8, names: []Parser.StyleRef) EmitError!void {
@@ -1001,49 +1082,25 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ", false, 0)\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "Label")) {
-            const text_child = try self.childText(el);
-            const text = if (text_child) |t| t.text else "";
             try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(300), .height = fixedSizing(24) }, layout_style));
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateLabel(");
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ", ");
-            const gen_start = self.out.items.len;
-            try writeGoStringLiteral(self.out, self.allocator, text);
-            const gen_end = self.out.items.len;
-            if (text_child) |t| {
-                const abs = translatePosition(self.body_line, self.body_col, t.line, t.col);
-                try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(t.text.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .child_text });
-                // Deliberately no semantic token here (unlike style-token
-                // names above) -- child text is a widget's own real,
-                // author-facing label, not string-literal *syntax* from
-                // the `.ntx` author's perspective, and coloring it like a
-                // string (Quinn's own click-through, 2026-08-26: rendered
-                // as an off-putting orange) obscured rather than clarified
-                // that it's plain text. Leaving it untokenized renders it
-                // in the editor's own default foreground color instead.
-            }
+            try self.emitWidgetText(el);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attr = "text";
         } else if (std.mem.eql(u8, el.tag, "Button")) {
-            const text_child = try self.childText(el);
-            const text = if (text_child) |t| t.text else "";
             try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateButton(");
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ", ");
-            const gen_start = self.out.items.len;
-            try writeGoStringLiteral(self.out, self.allocator, text);
-            const gen_end = self.out.items.len;
-            if (text_child) |t| {
-                const abs = translatePosition(self.body_line, self.body_col, t.line, t.col);
-                try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(t.text.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .child_text });
-                // Deliberately no semantic token here -- see the matching
-                // Label branch's own comment above.
-            }
+            try self.emitWidgetText(el);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attr = "text";
         } else if (std.mem.eql(u8, el.tag, "TextField")) {
             const placeholder_attr = try self.stringAttr(el, "placeholder");
             const placeholder = if (placeholder_attr) |pa| pa.value else "";
@@ -2628,4 +2685,84 @@ test "<Image src=...> naming a path never staged is a clear error, not a crash" 
     const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err != null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "never-staged.png") != null);
+}
+
+test "text={expr} on Label emits the raw expression unquoted, not a Go string literal" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Label text={msg.From} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateLabel(Label0Layout, msg.From)") != null);
+    // Never quoted -- would show up as a literal `"msg.From"` if the
+    // expr/child-text paths got crossed.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "\"msg.From\"") == null);
+}
+
+test "text=\"literal\" on Button emits a quoted Go string literal, same as literal child text would" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Button text="Save" />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateButton(Button0Layout, \"Save\")") != null);
+}
+
+test "text={expr} together with literal child text is a clear error, not silently one winning" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Label text={msg.From}>literal too</Label>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "text") != null);
+}
+
+test "text={expr} records a real .dynamic_text SourceMapping at the expression's own position" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Label text={msg.From} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const output = result.output.?;
+    var found_mapping = false;
+    for (output.source_map) |m| {
+        if (m.kind != .dynamic_text) continue;
+        found_mapping = true;
+        try std.testing.expectEqual(@as(u32, "msg.From".len), m.ntx_len);
+        try std.testing.expectEqualStrings(output.generated[m.gen_start..m.gen_end], "msg.From");
+    }
+    try std.testing.expect(found_mapping);
 }
