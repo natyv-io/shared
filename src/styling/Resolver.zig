@@ -45,6 +45,14 @@ pub const Direction = enum { topToBottom, leftToRight };
 pub const AlignX = enum { left, right, center };
 pub const AlignY = enum { top, bottom, center };
 
+/// Mirrors `widgets.Layout`'s own `ScrollVertical`/`ScrollHorizontal` bools
+/// -- a real, generic Clay-level feature (any Container ancestor with
+/// either set clips and scrolls its descendants, see natyv-core's
+/// `ScrollClip.zig`), not something specific to Table's own viewport
+/// (which just also happens to use it, plus its own virtualization on
+/// top). `.both` sets both axes.
+pub const Scroll = enum { vertical, horizontal, both };
+
 /// Mirrors `widgets.SizingAxis`'s own four real shapes (Fixed/Grow/Fit/
 /// Percent) -- `value` is only meaningful for `.fixed` (pixels) and
 /// `.percent` (a 0..1 fraction); `.grow`/`.fit` take no value at all,
@@ -80,6 +88,7 @@ pub const ResolvedStyleToken = struct {
     height: ?Sizing = null,
     align_x: ?AlignX = null,
     align_y: ?AlignY = null,
+    scroll: ?Scroll = null,
     /// Raw passthrough -- see file doc comment.
     text: ?Stylesheet.Value = null,
     /// Raw passthrough -- see file doc comment.
@@ -237,6 +246,15 @@ const Resolver = struct {
             self.fail(field.line, field.col, "field 'alignY': '{s}' is not 'top', 'bottom', or 'center'", .{id});
     }
 
+    fn resolveScroll(self: *Resolver, field: Stylesheet.Field) Error!Scroll {
+        const id = switch (field.value) {
+            .ident => |i| i,
+            else => return self.fail(field.line, field.col, "field 'scroll' must be a bare keyword ('vertical', 'horizontal', or 'both')", .{}),
+        };
+        return std.meta.stringToEnum(Scroll, id) orelse
+            self.fail(field.line, field.col, "field 'scroll': '{s}' is not 'vertical', 'horizontal', or 'both'", .{id});
+    }
+
     /// A bare number means a fixed pixel size (matches `padding`/`margin`'s
     /// own convention); the bare idents `grow`/`fit` need no value; a
     /// fraction needs a block since a lone number is already claimed by
@@ -289,6 +307,8 @@ const Resolver = struct {
                 out.align_x = try self.resolveAlignX(field);
             } else if (std.mem.eql(u8, field.key, "alignY")) {
                 out.align_y = try self.resolveAlignY(field);
+            } else if (std.mem.eql(u8, field.key, "scroll")) {
+                out.scroll = try self.resolveScroll(field);
             } else if (std.mem.eql(u8, field.key, "texture")) {
                 out.texture = try self.expectString(field);
             } else if (std.mem.eql(u8, field.key, "text")) {
@@ -376,6 +396,30 @@ test "resolves the real layout vocabulary: direction, childGap, width/height, al
     try std.testing.expectEqual(@as(f32, 40), tok.height.?.value);
     try std.testing.expectEqual(AlignX.center, tok.align_x.?);
     try std.testing.expectEqual(AlignY.center, tok.align_y.?);
+}
+
+test "resolves 'scroll' as a bare keyword: vertical, horizontal, both" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const v = try parseAndResolve(arena.allocator(), "list { scroll: vertical }");
+    try std.testing.expect(v.resolve_err == null);
+    try std.testing.expectEqual(Scroll.vertical, v.tokens[0].scroll.?);
+
+    const h = try parseAndResolve(arena.allocator(), "list { scroll: horizontal }");
+    try std.testing.expect(h.resolve_err == null);
+    try std.testing.expectEqual(Scroll.horizontal, h.tokens[0].scroll.?);
+
+    const b = try parseAndResolve(arena.allocator(), "list { scroll: both }");
+    try std.testing.expect(b.resolve_err == null);
+    try std.testing.expectEqual(Scroll.both, b.tokens[0].scroll.?);
+}
+
+test "rejects an invalid 'scroll' keyword" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), "list { scroll: diagonal }");
+    try std.testing.expect(result.resolve_err != null);
 }
 
 test "resolves width as a percent block and as 'fit'" {

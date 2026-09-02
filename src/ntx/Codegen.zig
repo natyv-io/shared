@@ -720,6 +720,7 @@ const Emitter = struct {
         height: ?Resolver.Sizing = null,
         align_x: ?[]const u8 = null, // raw Go expr, e.g. "widgets.AlignXCenter"
         align_y: ?[]const u8 = null,
+        scroll: ?Resolver.Scroll = null,
     };
 
     /// `.ntx`-authored `width_fixed`/`height_fixed`-shaped convenience for
@@ -837,6 +838,18 @@ const Emitter = struct {
             }
             try self.out.appendSlice(self.allocator, "}\n");
         }
+        if (d.scroll) |s| {
+            if (s == .vertical or s == .both) {
+                try self.out.appendSlice(self.allocator, "\t");
+                try self.out.appendSlice(self.allocator, layout_var);
+                try self.out.appendSlice(self.allocator, ".ScrollVertical = true\n");
+            }
+            if (s == .horizontal or s == .both) {
+                try self.out.appendSlice(self.allocator, "\t");
+                try self.out.appendSlice(self.allocator, layout_var);
+                try self.out.appendSlice(self.allocator, ".ScrollHorizontal = true\n");
+            }
+        }
     }
 
     /// Looks up the `styles={...}` attribute (if any) and resolves its
@@ -869,6 +882,7 @@ const Emitter = struct {
         height: ?Resolver.Sizing = null,
         align_x: ?Resolver.AlignX = null,
         align_y: ?Resolver.AlignY = null,
+        scroll: ?Resolver.Scroll = null,
     };
 
     fn layoutStyleFor(self: *Emitter, el: Parser.Element) LayoutStyleOverride {
@@ -890,6 +904,7 @@ const Emitter = struct {
                         if (tok.height) |h| out.height = h;
                         if (tok.align_x) |ax| out.align_x = ax;
                         if (tok.align_y) |ay| out.align_y = ay;
+                        if (tok.scroll) |s| out.scroll = s;
                         break;
                     }
                 }
@@ -934,6 +949,7 @@ const Emitter = struct {
         if (style.height) |h| out.height = h;
         if (style.align_x) |ax| out.align_x = alignXExpr(ax);
         if (style.align_y) |ay| out.align_y = alignYExpr(ay);
+        if (style.scroll) |s| out.scroll = s;
         return out;
     }
 
@@ -3656,6 +3672,52 @@ test "<Dropdown ref={&x}/> assigns the already-pointer var directly, no extra &"
     try std.testing.expect(r.err == null);
     try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myDropdown = Dropdown0") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myDropdown = &Dropdown0") == null);
+}
+
+test "styles={...} naming a token with scroll: vertical emits .ScrollVertical = true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const src =
+        \\package main
+        \\
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Container styles={list}></Container>
+        \\}
+    ;
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "list", .scroll = .vertical }};
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.ScrollVertical = true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "ScrollHorizontal") == null);
+}
+
+test "styles={...} naming a token with scroll: both emits both axes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const src =
+        \\package main
+        \\
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Container styles={grid}></Container>
+        \\}
+    ;
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "grid", .scroll = .both }};
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.ScrollVertical = true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.ScrollHorizontal = true") != null);
 }
 
 test "<Table styles={...}/> also targets .ID() -- covers the pointer-returning family generally" {
