@@ -582,10 +582,18 @@ const Emitter = struct {
         }
     }
 
-    fn emitApplyStyle(self: *Emitter, var_name: []const u8, names: []Parser.StyleRef) EmitError!void {
-        try self.out.appendSlice(self.allocator, "\tif err := widgets.ApplyStyle(uint32(");
-        try self.out.appendSlice(self.allocator, var_name);
-        try self.out.appendSlice(self.allocator, "), StyleTokens");
+    /// `id_expr` is the already-fully-formed Go expression yielding this
+    /// widget's uint32 id -- `uint32(<var>)` for every ordinary
+    /// uint32-based widget, or `<var>.ID()` for a
+    /// `isStructBackedWidgetKind` tag (see call site in `emitElement`).
+    /// Building that choice into the caller instead of here keeps this
+    /// function itself tag-agnostic, matching `emitApplyStyleWithTexture`
+    /// below (which never needs the struct-backed case at all -- `<Image>`
+    /// is always Container-backed).
+    fn emitApplyStyle(self: *Emitter, id_expr: []const u8, names: []Parser.StyleRef) EmitError!void {
+        try self.out.appendSlice(self.allocator, "\tif err := widgets.ApplyStyle(");
+        try self.out.appendSlice(self.allocator, id_expr);
+        try self.out.appendSlice(self.allocator, ", StyleTokens");
         for (names) |n| {
             try self.out.appendSlice(self.allocator, ", ");
             const abs = translatePosition(self.body_line, self.body_col, n.line, n.col);
@@ -634,14 +642,22 @@ const Emitter = struct {
     /// Real type mismatches (e.g. a `*widgets.Label` ref on a `<Button>`)
     /// are deliberately left for Go's own compiler to catch -- natyv
     /// doesn't re-implement Go's type checker to pre-validate this.
-    fn emitRefAssign(self: *Emitter, target: []const u8, var_name: []const u8, line: u32, col: u32) EmitError!void {
+    /// `already_pointer` (true for `isPointerReturningWidgetKind`, e.g.
+    /// Dropdown/Table) skips the usual `&` -- `var_name` there is already
+    /// the `*Struct` a `ref` target of the same declared type expects, so
+    /// `target = &var_name` would produce a `**Struct` instead (a real
+    /// compile error against any naturally-declared `*widgets.Dropdown`
+    /// target). Every other widget kind (uint32-based, or the one
+    /// value-struct exception Breadcrumbs) still needs the `&`, exactly
+    /// like before.
+    fn emitRefAssign(self: *Emitter, target: []const u8, var_name: []const u8, already_pointer: bool, line: u32, col: u32) EmitError!void {
         try self.out.appendSlice(self.allocator, "\t");
         const abs = translatePosition(self.body_line, self.body_col, line, col);
         const gen_start = self.out.items.len;
         try self.out.appendSlice(self.allocator, target);
         const gen_end = self.out.items.len;
         try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(target.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .ref_target });
-        try self.out.appendSlice(self.allocator, " = &");
+        try self.out.appendSlice(self.allocator, if (already_pointer) " = " else " = &");
         try self.out.appendSlice(self.allocator, var_name);
         try self.out.appendSlice(self.allocator, "\n");
     }
@@ -960,6 +976,48 @@ const Emitter = struct {
 
     fn isBuiltinWidgetKind(tag: []const u8) bool {
         for (builtin_widget_kinds) |kind| {
+            if (std.mem.eql(u8, tag, kind)) return true;
+        }
+        return false;
+    }
+
+    /// Stage-1 widget kinds whose `Create*` returns something other than a
+    /// plain uint32-based named type (every other builtin -- Container,
+    /// Button, Checkbox, ... -- is `type X uint32`, so `uint32(<var>)`
+    /// compiles directly). These 7 are either a `*Struct` (Combobox,
+    /// Dropdown, Menu, MenuBar, Table, Tree) or a multi-field struct value
+    /// (Breadcrumbs) -- `uint32(<var>)` is a real Go compile error for both
+    /// shapes. Each now exposes a real `ID()` method (see e.g.
+    /// `sdks/go/widgets/dropdown.go`) as the `styles={...}` target instead.
+    /// Found the hard way (2026-09-02): Stage 1's own end-to-end
+    /// verification exercised `columns=`/`rows=` on Table but never
+    /// `styles=` on any of these 7, so this shipped uncaught.
+    const struct_backed_widget_kinds = [_][]const u8{
+        "Combobox", "Dropdown", "Breadcrumbs", "Menu", "MenuBar", "Table", "Tree",
+    };
+
+    fn isStructBackedWidgetKind(tag: []const u8) bool {
+        for (struct_backed_widget_kinds) |kind| {
+            if (std.mem.eql(u8, tag, kind)) return true;
+        }
+        return false;
+    }
+
+    /// The subset of `struct_backed_widget_kinds` whose `Create*` returns a
+    /// pointer (`*Struct`) rather than a value -- `var_name` at the ref
+    /// call site is therefore already the pointer `ref={&x}` is meant to
+    /// hand `x`, so `emitRefAssign` must skip its usual `&` (which would
+    /// otherwise produce a `**Struct`, e.g. `**Dropdown`, that no
+    /// naturally-declared `ref` target variable's type would ever match).
+    /// Breadcrumbs is deliberately excluded: `CreateBreadcrumbs` returns a
+    /// plain value, so it needs the same `&var_name` every uint32-based
+    /// widget already gets.
+    const pointer_returning_widget_kinds = [_][]const u8{
+        "Combobox", "Dropdown", "Menu", "MenuBar", "Table", "Tree",
+    };
+
+    fn isPointerReturningWidgetKind(tag: []const u8) bool {
+        for (pointer_returning_widget_kinds) |kind| {
             if (std.mem.eql(u8, tag, kind)) return true;
         }
         return false;
@@ -1651,8 +1709,12 @@ const Emitter = struct {
                         if (is_image_tag) {
                             try self.emitApplyStyleWithTexture(var_name, names, image_texture_id);
                             image_styles_emitted = true;
+                        } else if (isStructBackedWidgetKind(el.tag)) {
+                            const id_expr = try std.fmt.allocPrint(self.allocator, "{s}.ID()", .{var_name});
+                            try self.emitApplyStyle(id_expr, names);
                         } else {
-                            try self.emitApplyStyle(var_name, names);
+                            const id_expr = try std.fmt.allocPrint(self.allocator, "uint32({s})", .{var_name});
+                            try self.emitApplyStyle(id_expr, names);
                         }
                     },
                     else => return self.fail(attr.line, attr.col, "dynamic 'styles' expressions aren't supported until a future stage", .{}),
@@ -1664,7 +1726,7 @@ const Emitter = struct {
                     // in `ref={&nameField}`), not `ref`'s own position --
                     // the position a real hover/go-to-definition request
                     // against that identifier actually needs.
-                    .ref => |r| try self.emitRefAssign(r.target, var_name, r.line, r.col),
+                    .ref => |r| try self.emitRefAssign(r.target, var_name, isPointerReturningWidgetKind(el.tag), r.line, r.col),
                     else => return self.fail(attr.line, attr.col, "malformed 'ref' attribute", .{}),
                 }
             } else if (isEventAttr(attr.name)) {
@@ -3579,12 +3641,53 @@ test "<Dropdown options={...}>Pick one</Dropdown> uses child text as the trigger
     try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateDropdown(Dropdown0Layout, \"Pick one\", opts)") != null);
 }
 
+test "<Dropdown styles={...}/> targets .ID(), not uint32(...) -- Dropdown isn't uint32-based" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Dropdown styles={nav} options={opts}>Pick one</Dropdown>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.ApplyStyle(Dropdown0.ID(), StyleTokens, \"nav\")") != null);
+}
+
+test "<Dropdown ref={&x}/> assigns the already-pointer var directly, no extra &" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Dropdown ref={&myDropdown} options={opts}>Pick one</Dropdown>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myDropdown = Dropdown0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myDropdown = &Dropdown0") == null);
+}
+
+test "<Table styles={...}/> also targets .ID() -- covers the pointer-returning family generally" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Table styles={nav} columns={cols} rows={data} rowHeight={24} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.ApplyStyle(Table0.ID(), StyleTokens, \"nav\")") != null);
+}
+
 test "<Breadcrumbs crumbs={} separator=\"/\" /> forwards both real args" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Breadcrumbs crumbs={path} separator=\"/\" />\n}\n");
     try std.testing.expect(r.err == null);
     try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateBreadcrumbs(Breadcrumbs0Layout, path, \"/\")") != null);
+}
+
+test "<Breadcrumbs styles={...}/> also targets .ID() -- CreateBreadcrumbs returns a value, not a pointer, but still isn't uint32-based" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Breadcrumbs styles={nav} crumbs={path} separator=\"/\" />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.ApplyStyle(Breadcrumbs0.ID(), StyleTokens, \"nav\")") != null);
+}
+
+test "<Breadcrumbs ref={&x}/> still uses & -- CreateBreadcrumbs returns a value, unlike Dropdown/Table/..." {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Breadcrumbs ref={&myTrail} crumbs={path} separator=\"/\" />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myTrail = &Breadcrumbs0") != null);
 }
 
 test "<Menu items={...}>File</Menu> uses child text as the trigger label" {
