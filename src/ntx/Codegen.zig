@@ -714,6 +714,23 @@ const Emitter = struct {
         return .{ .kind = .fixed, .value = px };
     }
 
+    /// The right "other axis" default whenever `emitLayout` has to emit a
+    /// `Sizing` assignment at all but one axis was never actually given a
+    /// value (a bare `<Container>`'s own `LayoutDefaults` sets neither
+    /// axis by default, so a `styles={...}` token naming only `width` --
+    /// `field`/`bodyArea`/`rowContent` in mail-natyv all do exactly this
+    /// -- left the *other* axis with nothing to fall back to). Real,
+    /// confirmed bug fixed here (2026-09-02): the old fallback was
+    /// `fixedSizing(0)`, silently collapsing that axis to zero pixels --
+    /// a Container whose children need more room than that then visibly
+    /// overflows its own now-zero-height box. `Fit` (size to the actual
+    /// content, the same thing a completely unstyled Container's own
+    /// omitted Sizing already resolves to host-side) is what "no opinion
+    /// on this axis" should have meant all along.
+    fn fitSizing() Resolver.Sizing {
+        return .{ .kind = .fit, .value = 0 };
+    }
+
     fn appendNum(self: *Emitter, comptime fmt: []const u8, value: anytype) EmitError!void {
         var buf: [32]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, fmt, .{value}) catch unreachable; // 32 bytes is ample for any u16/f32 here
@@ -779,8 +796,8 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, "}\n");
         }
         if (d.width != null or d.height != null) {
-            const w = d.width orelse fixedSizing(0);
-            const h = d.height orelse fixedSizing(0);
+            const w = d.width orelse fitSizing();
+            const h = d.height orelse fitSizing();
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ".Sizing = widgets.Sizing{Width: ");
@@ -2630,8 +2647,11 @@ test "styles naming a token overrides direction, childGap, width, and alignment 
     // no-op check; a real override always writes the assignment regardless.
     try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.ChildGap = 8") != null);
     // Width set to Grow (the Container tag has no width/height default at
-    // all normally, so this line only appears because of the override).
-    try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.Sizing = widgets.Sizing{Width: widgets.Grow(), Height: widgets.Fixed(0)}") != null);
+    // all normally, so this line only appears because of the override);
+    // Height falls back to Fit, not Fixed(0) -- the token here never set
+    // it, and "no opinion on this axis" should size to content, not
+    // collapse to zero (see fitSizing's own doc comment).
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.Sizing = widgets.Sizing{Width: widgets.Grow(), Height: widgets.Fit()}") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.ChildAlignment = widgets.Alignment{Y: widgets.AlignYCenter}") != null);
     // The Container tag's own hardcoded Padding default (8) survives
     // untouched -- the style token above never set `padding`.
