@@ -396,7 +396,10 @@ const Emitter = struct {
     }
 
     fn consumesTextChildren(tag: []const u8) bool {
-        return std.mem.eql(u8, tag, "Label") or std.mem.eql(u8, tag, "Button") or std.mem.eql(u8, tag, "TextArea");
+        for ([_][]const u8{ "Label", "Button", "TextArea", "Checkbox", "RadioButton", "Toggle", "Badge", "Dropdown", "Menu" }) |t| {
+            if (std.mem.eql(u8, tag, t)) return true;
+        }
+        return false;
     }
 
     /// Looks up a plain (non-braced) string attribute by name -- e.g.
@@ -428,16 +431,106 @@ const Emitter = struct {
     /// rejected attribute shape in this file.
     const TextAttr = struct { expr: []const u8, quoted: bool, line: u32, col: u32 };
 
-    fn textAttr(self: *Emitter, el: Parser.Element) EmitError!?TextAttr {
+    /// Generalizes the dual string-literal/expr acceptance `text={expr}`
+    /// pioneered (2026-09-02, widening `.ntx` to the SDK's other 27
+    /// widget kinds) to *any* attribute name -- e.g. `title=` (Card/
+    /// Window/Dialog), `separator=` (Breadcrumbs), `placeholder=`
+    /// (Combobox) all need the identical "plain string or braced
+    /// expression" shape `text=` already has, just under a different
+    /// name. `textAttr` below is now a thin wrapper over this for the
+    /// `text` case specifically, so `emitWidgetText`'s existing callers
+    /// are untouched.
+    fn namedTextAttr(self: *Emitter, el: Parser.Element, name: []const u8) EmitError!?TextAttr {
         for (el.attrs) |attr| {
-            if (!std.mem.eql(u8, attr.name, "text")) continue;
+            if (!std.mem.eql(u8, attr.name, name)) continue;
             return switch (attr.value) {
                 .string_literal => |s| .{ .expr = s, .quoted = true, .line = attr.line, .col = attr.col },
                 .expr => |e| .{ .expr = e.expr, .quoted = false, .line = e.line, .col = e.col },
-                else => self.fail(attr.line, attr.col, "'text' must be a plain string or a braced expression, e.g. text=\"...\" or text={{expr}}", .{}),
+                else => self.fail(attr.line, attr.col, "'{s}' must be a plain string or a braced expression, e.g. {s}=\"...\" or {s}={{expr}}", .{ name, name, name }),
             };
         }
         return null;
+    }
+
+    fn textAttr(self: *Emitter, el: Parser.Element) EmitError!?TextAttr {
+        return self.namedTextAttr(el, "text");
+    }
+
+    fn requiredNamedTextAttr(self: *Emitter, el: Parser.Element, name: []const u8) EmitError!TextAttr {
+        return (try self.namedTextAttr(el, name)) orelse self.fail(el.line, el.col, "<{s}> requires a '{s}=\"...\"' or '{s}={{expr}}' attribute", .{ el.tag, name, name });
+    }
+
+    /// Emits a resolved `namedTextAttr` value (quoted-or-raw) directly
+    /// into `self.out` at the current position, recording a `.dynamic_text`
+    /// `SourceMapping` for real LSP hover support on the expression/string
+    /// itself -- the emission half of `namedTextAttr`, shared by every new
+    /// widget kind that takes a `title=`/`separator=`/`placeholder=`-style
+    /// string-or-expr constructor argument.
+    fn emitNamedTextAttrValue(self: *Emitter, ta: TextAttr) EmitError!void {
+        const gen_start = self.out.items.len;
+        if (ta.quoted) {
+            try writeGoStringLiteral(self.out, self.allocator, ta.expr);
+        } else {
+            try self.out.appendSlice(self.allocator, ta.expr);
+        }
+        const gen_end = self.out.items.len;
+        const abs = translatePosition(self.body_line, self.body_col, ta.line, ta.col);
+        try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(ta.expr.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .dynamic_text });
+    }
+
+    /// A required, expr-only attribute (2026-09-02) -- for a constructor
+    /// argument that's never a plain string (numbers, bools, slices,
+    /// struct literals: `value={0.5}`, `columns={myColumns}`,
+    /// `wrap={true}`) and has no natural default in the real SDK
+    /// constructor it maps to, so absence is a clear error, not silently
+    /// defaulted. Never accepts a bare string literal -- e.g. `min="5"`
+    /// would paste an invalid quoted string where a `float32` argument is
+    /// expected, so that shape is rejected with the same clarity a
+    /// missing attribute gets.
+    const ExprAttr = struct { expr: []const u8, line: u32, col: u32 };
+
+    fn exprAttr(self: *Emitter, el: Parser.Element, name: []const u8) EmitError!?ExprAttr {
+        for (el.attrs) |attr| {
+            if (!std.mem.eql(u8, attr.name, name)) continue;
+            return switch (attr.value) {
+                .expr => |e| .{ .expr = e.expr, .line = e.line, .col = e.col },
+                else => self.fail(attr.line, attr.col, "'{s}' must be a braced expression, e.g. {s}={{expr}}", .{ name, name }),
+            };
+        }
+        return null;
+    }
+
+    fn requiredExprAttr(self: *Emitter, el: Parser.Element, name: []const u8) EmitError!ExprAttr {
+        return (try self.exprAttr(el, name)) orelse self.fail(el.line, el.col, "<{s}> requires a '{s}={{expr}}' attribute", .{ el.tag, name });
+    }
+
+    /// Emits a resolved `ExprAttr`'s raw expression verbatim, with a real
+    /// `SourceMapping` for LSP hover -- the emission half of `exprAttr`/
+    /// `requiredExprAttr`, shared by every new widget kind's own non-
+    /// string constructor arguments.
+    fn emitExprAttrValue(self: *Emitter, ea: ExprAttr) EmitError!void {
+        const gen_start = self.out.items.len;
+        try self.out.appendSlice(self.allocator, ea.expr);
+        const gen_end = self.out.items.len;
+        const abs = translatePosition(self.body_line, self.body_col, ea.line, ea.col);
+        try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(ea.expr.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .dynamic_text });
+    }
+
+    /// Shared by every new leaf widget kind that has no meaningful
+    /// children of its own (everything in this batch except `Panel`,
+    /// which behaves exactly like `Container`) -- same "clear codegen
+    /// error, not silently dropped" posture `<Image>` already has.
+    fn rejectChildren(self: *Emitter, el: Parser.Element) EmitError!void {
+        if (el.children.len > 0) return self.fail(el.line, el.col, "<{s}> doesn't accept children", .{el.tag});
+    }
+
+    /// Whether `name` is one of a tag's own already-consumed attribute
+    /// names (see `skip_attrs`'s own doc comment in `emitElement`).
+    fn isSkippedAttr(name: []const u8, skip_attrs: []const []const u8) bool {
+        for (skip_attrs) |s| {
+            if (std.mem.eql(u8, s, name)) return true;
+        }
+        return false;
     }
 
     /// Shared by Label/Button's own branches in `emitElement`: resolves
@@ -832,7 +925,13 @@ const Emitter = struct {
     /// in sync by hand -- avoids exactly the kind of drift this project
     /// already added a dedicated regression test for once before
     /// (`BindingsHostFnUtil.zig`).
-    pub const builtin_widget_kinds = [_][]const u8{ "Container", "Label", "Button", "TextField", "TextArea", "Image" };
+    pub const builtin_widget_kinds = [_][]const u8{
+        "Container", "Label",           "Button",          "TextField", "TextArea",
+        "Image",     "Checkbox",        "RadioButton",     "Toggle",    "Slider",
+        "RangeSlider", "NumericStepper", "SegmentedControl", "Divider",   "ProgressBar",
+        "Badge",     "Spinner",         "Panel",           "Combobox",  "Dropdown",
+        "Breadcrumbs", "Menu",          "MenuBar",         "Table",     "Tree",
+    };
 
     fn isBuiltinWidgetKind(tag: []const u8) bool {
         for (builtin_widget_kinds) |kind| {
@@ -1113,7 +1212,13 @@ const Emitter = struct {
         const var_name = try std.fmt.allocPrint(self.allocator, "{s}{d}", .{ el.tag, self.counter });
         self.counter += 1;
         const layout_var = try std.fmt.allocPrint(self.allocator, "{s}Layout", .{var_name});
-        var skip_attr: ?[]const u8 = null;
+        // A slice (2026-09-02, widened from a single optional name to
+        // support widgets with several own-consumed attributes at once,
+        // e.g. NumericStepper's value/min/max/step/wrap) rather than one
+        // `?[]const u8` -- everything named here is already consumed by
+        // this tag's own branch above and must not also hit the generic
+        // "attribute isn't supported yet" fallback below.
+        var skip_attrs: []const []const u8 = &.{};
         var is_image_tag = false;
         var image_texture_id: u32 = undefined;
         var image_styles_emitted = false;
@@ -1134,7 +1239,7 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ", ");
             try self.emitWidgetText(el);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
-            skip_attr = "text";
+            skip_attrs = &.{"text"};
         } else if (std.mem.eql(u8, el.tag, "Button")) {
             try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
             try self.out.appendSlice(self.allocator, "\t");
@@ -1144,7 +1249,7 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ", ");
             try self.emitWidgetText(el);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
-            skip_attr = "text";
+            skip_attrs = &.{"text"};
         } else if (std.mem.eql(u8, el.tag, "TextField")) {
             const placeholder_attr = try self.stringAttr(el, "placeholder");
             const placeholder = if (placeholder_attr) |pa| pa.value else "";
@@ -1162,7 +1267,7 @@ const Emitter = struct {
                 try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(pa.value.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .string_literal });
             }
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
-            skip_attr = "placeholder";
+            skip_attrs = &.{"placeholder"};
         } else if (std.mem.eql(u8, el.tag, "TextArea")) {
             // Real, initial-content role (like Label/Button's own `text`),
             // not a separate placeholder-vs-content distinction the way
@@ -1179,7 +1284,276 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ", ");
             try self.emitWidgetText(el);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
-            skip_attr = "text";
+            skip_attrs = &.{"text"};
+        } else if (std.mem.eql(u8, el.tag, "Checkbox")) {
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(24) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateCheckbox(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitWidgetText(el);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{"text"};
+        } else if (std.mem.eql(u8, el.tag, "RadioButton")) {
+            // `group={expr}` -- the real SDK's own mutual-exclusion tag
+            // (`groupID uint32`, an app-picked arbitrary value, not a
+            // widget id) -- required, since the real constructor has no
+            // default for it.
+            const group = try self.requiredExprAttr(el, "group");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(24) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateRadioButton(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(group);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitWidgetText(el);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "group", "text" };
+        } else if (std.mem.eql(u8, el.tag, "Toggle")) {
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(24) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateToggle(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitWidgetText(el);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{"text"};
+        } else if (std.mem.eql(u8, el.tag, "Slider")) {
+            try self.rejectChildren(el);
+            const value = try self.requiredExprAttr(el, "value");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(200), .height = fixedSizing(24) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateSlider(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(value);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{"value"};
+        } else if (std.mem.eql(u8, el.tag, "RangeSlider")) {
+            try self.rejectChildren(el);
+            const min = try self.requiredExprAttr(el, "min");
+            const max = try self.requiredExprAttr(el, "max");
+            const step = try self.requiredExprAttr(el, "step");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(200), .height = fixedSizing(24) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateRangeSlider(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(min);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(max);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(step);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "min", "max", "step" };
+        } else if (std.mem.eql(u8, el.tag, "NumericStepper")) {
+            try self.rejectChildren(el);
+            const value = try self.requiredExprAttr(el, "value");
+            const min = try self.requiredExprAttr(el, "min");
+            const max = try self.requiredExprAttr(el, "max");
+            const step = try self.requiredExprAttr(el, "step");
+            const wrap = try self.requiredExprAttr(el, "wrap");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateNumericStepper(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(value);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(min);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(max);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(step);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(wrap);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "value", "min", "max", "step", "wrap" };
+        } else if (std.mem.eql(u8, el.tag, "SegmentedControl")) {
+            try self.rejectChildren(el);
+            const segments = try self.requiredExprAttr(el, "segments");
+            const selected = try self.requiredExprAttr(el, "selected");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(240), .height = fixedSizing(32) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateSegmentedControl(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(segments);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(selected);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "segments", "selected" };
+        } else if (std.mem.eql(u8, el.tag, "Divider")) {
+            try self.rejectChildren(el);
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(1) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateDivider(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+        } else if (std.mem.eql(u8, el.tag, "ProgressBar")) {
+            try self.rejectChildren(el);
+            const value = try self.requiredExprAttr(el, "value");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(12) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateProgressBar(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(value);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{"value"};
+        } else if (std.mem.eql(u8, el.tag, "Badge")) {
+            const tone = try self.requiredExprAttr(el, "tone");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(80), .height = fixedSizing(20) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateBadge(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(tone);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitWidgetText(el);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "tone", "text" };
+        } else if (std.mem.eql(u8, el.tag, "Spinner")) {
+            try self.rejectChildren(el);
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(24), .height = fixedSizing(24) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateSpinner(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+        } else if (std.mem.eql(u8, el.tag, "Panel")) {
+            // `CreatePanel(layout)` is real SDK sugar for
+            // `CreateContainer(layout, true, 0)` -- accepts children
+            // exactly like `<Container>` does (the generic children loop
+            // below this whole dispatch chain handles them identically).
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreatePanel(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+        } else if (std.mem.eql(u8, el.tag, "Combobox")) {
+            try self.rejectChildren(el);
+            const placeholder_attr = try self.namedTextAttr(el, "placeholder");
+            const options = try self.requiredExprAttr(el, "options");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(240), .height = fixedSizing(32) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateCombobox(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            if (placeholder_attr) |pa| {
+                try self.emitNamedTextAttrValue(pa);
+            } else {
+                try writeGoStringLiteral(self.out, self.allocator, "");
+            }
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(options);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "placeholder", "options" };
+        } else if (std.mem.eql(u8, el.tag, "Dropdown")) {
+            const options = try self.requiredExprAttr(el, "options");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(32) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateDropdown(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitWidgetText(el);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(options);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "text", "options" };
+        } else if (std.mem.eql(u8, el.tag, "Breadcrumbs")) {
+            try self.rejectChildren(el);
+            const crumbs = try self.requiredExprAttr(el, "crumbs");
+            const separator = try self.requiredNamedTextAttr(el, "separator");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(24) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateBreadcrumbs(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(crumbs);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitNamedTextAttrValue(separator);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "crumbs", "separator" };
+        } else if (std.mem.eql(u8, el.tag, "Menu")) {
+            const items = try self.requiredExprAttr(el, "items");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(32) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateMenu(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitWidgetText(el);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(items);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "text", "items" };
+        } else if (std.mem.eql(u8, el.tag, "MenuBar")) {
+            try self.rejectChildren(el);
+            const entries = try self.requiredExprAttr(el, "entries");
+            const item_width = try self.requiredExprAttr(el, "itemWidth");
+            const item_height = try self.requiredExprAttr(el, "itemHeight");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(32) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateMenuBar(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(entries);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(item_width);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(item_height);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "entries", "itemWidth", "itemHeight" };
+        } else if (std.mem.eql(u8, el.tag, "Table")) {
+            try self.rejectChildren(el);
+            const columns = try self.requiredExprAttr(el, "columns");
+            const rows = try self.requiredExprAttr(el, "rows");
+            const row_height = try self.requiredExprAttr(el, "rowHeight");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(240) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateTable(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(columns);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(rows);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(row_height);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "columns", "rows", "rowHeight" };
+        } else if (std.mem.eql(u8, el.tag, "Tree")) {
+            try self.rejectChildren(el);
+            const roots = try self.requiredExprAttr(el, "roots");
+            const row_height = try self.requiredExprAttr(el, "rowHeight");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(240) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateTree(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(roots);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(row_height);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "roots", "rowHeight" };
         } else if (std.mem.eql(u8, el.tag, "Image")) {
             // `background: true` (not false) is required -- Container's
             // own fillRect() dispatch returns null entirely when
@@ -1202,7 +1576,7 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(");
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ", true, 0)\n\tif err != nil {\n\t\treturn err\n\t}\n");
-            skip_attr = "src";
+            skip_attrs = &.{"src"};
         } else {
             return self.fail(el.line, el.col, "'{s}' isn't a supported widget kind, and no composer named '{s}' is exposed in this file", .{ el.tag, el.tag });
         }
@@ -1217,7 +1591,7 @@ const Emitter = struct {
         try self.out.appendSlice(self.allocator, "\n");
 
         for (el.attrs) |attr| {
-            if (skip_attr != null and std.mem.eql(u8, attr.name, skip_attr.?)) continue;
+            if (isSkippedAttr(attr.name, skip_attrs)) continue;
             if (std.mem.eql(u8, attr.name, "styles")) {
                 switch (attr.value) {
                     .styles => |names| {
@@ -2984,4 +3358,185 @@ test "<TextArea>literal placeholder</TextArea> still works as plain child text" 
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateTextArea(TextArea0Layout, \"Body\")") != null);
+}
+
+fn testGenerated(allocator: std.mem.Allocator, src: []const u8) !struct { err: ?CodegenError, generated: ?[]const u8 } {
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    if (result.err) |e| return .{ .err = e, .generated = null };
+    return .{ .err = null, .generated = result.output.?.generated };
+}
+
+test "<Checkbox> uses text=/child text for its label, like Button" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Checkbox>Enable notifications</Checkbox>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateCheckbox(Checkbox0Layout, \"Enable notifications\")") != null);
+}
+
+test "<RadioButton> requires group={expr} and forwards it before the label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <RadioButton group={1} text=\"A\" />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateRadioButton(RadioButton0Layout, 1, \"A\")") != null);
+}
+
+test "<RadioButton> without group= is a clear error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <RadioButton text=\"A\" />\n}\n");
+    try std.testing.expect(r.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err.?.message, "group") != null);
+}
+
+test "<Toggle> compiles to CreateToggle with its label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Toggle text=\"Dark mode\" />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateToggle(Toggle0Layout, \"Dark mode\")") != null);
+}
+
+test "<Slider value={...} /> compiles correctly and rejects children" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Slider value={0.5} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateSlider(Slider0Layout, 0.5)") != null);
+
+    var arena2 = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena2.deinit();
+    const r2 = try testGenerated(arena2.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Slider value={0.5}><Label>no</Label></Slider>\n}\n");
+    try std.testing.expect(r2.err != null);
+}
+
+test "<RangeSlider min={} max={} step={} /> forwards all three in order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <RangeSlider min={0.2} max={0.8} step={0.1} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateRangeSlider(RangeSlider0Layout, 0.2, 0.8, 0.1)") != null);
+}
+
+test "<NumericStepper> forwards value/min/max/step/wrap in real SDK order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <NumericStepper value={1} min={0} max={10} step={1} wrap={false} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateNumericStepper(NumericStepper0Layout, 1, 0, 10, 1, false)") != null);
+}
+
+test "<SegmentedControl segments={} selected={} /> compiles correctly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <SegmentedControl segments={[]string{\"A\", \"B\"}} selected={0} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateSegmentedControl(SegmentedControl0Layout, []string{\"A\", \"B\"}, 0)") != null);
+}
+
+test "<Divider/> takes no extra args and rejects children" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Divider/>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateDivider(Divider0Layout)") != null);
+}
+
+test "<ProgressBar value={...} /> compiles correctly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <ProgressBar value={0.4} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateProgressBar(ProgressBar0Layout, 0.4)") != null);
+}
+
+test "<Badge tone={...}>label</Badge> forwards tone then the label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Badge tone={widgets.BadgeTonePrimary}>New</Badge>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateBadge(Badge0Layout, widgets.BadgeTonePrimary, \"New\")") != null);
+}
+
+test "<Spinner/> takes no args and rejects children" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Spinner/>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateSpinner(Spinner0Layout)") != null);
+}
+
+test "<Panel> accepts real children, exactly like <Container>" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Panel><Label>hi</Label></Panel>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreatePanel(Panel0Layout)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateLabel(Label1Layout, \"hi\")") != null);
+}
+
+test "<Combobox options={...}/> defaults placeholder to an empty string when absent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Combobox options={opts} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateCombobox(Combobox0Layout, \"\", opts)") != null);
+}
+
+test "<Combobox placeholder=\"...\" options={...}/> forwards both real args" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Combobox placeholder=\"Search\" options={opts} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateCombobox(Combobox0Layout, \"Search\", opts)") != null);
+}
+
+test "<Dropdown options={...}>Pick one</Dropdown> uses child text as the trigger label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Dropdown options={opts}>Pick one</Dropdown>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateDropdown(Dropdown0Layout, \"Pick one\", opts)") != null);
+}
+
+test "<Breadcrumbs crumbs={} separator=\"/\" /> forwards both real args" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Breadcrumbs crumbs={path} separator=\"/\" />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateBreadcrumbs(Breadcrumbs0Layout, path, \"/\")") != null);
+}
+
+test "<Menu items={...}>File</Menu> uses child text as the trigger label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Menu items={fileItems}>File</Menu>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateMenu(Menu0Layout, \"File\", fileItems)") != null);
+}
+
+test "<MenuBar entries={} itemWidth={} itemHeight={} /> forwards all three" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <MenuBar entries={bar} itemWidth={80} itemHeight={28} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateMenuBar(MenuBar0Layout, bar, 80, 28)") != null);
+}
+
+test "<Table columns={} rows={} rowHeight={} /> forwards all three real args" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Table columns={cols} rows={data} rowHeight={28} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateTable(Table0Layout, cols, data, 28)") != null);
+}
+
+test "<Tree roots={} rowHeight={} /> forwards both real args" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Tree roots={nodes} rowHeight={24} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateTree(Tree0Layout, nodes, 24)") != null);
 }
