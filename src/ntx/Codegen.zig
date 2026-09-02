@@ -396,7 +396,7 @@ const Emitter = struct {
     }
 
     fn consumesTextChildren(tag: []const u8) bool {
-        for ([_][]const u8{ "Label", "Button", "TextArea", "Checkbox", "RadioButton", "Toggle", "Badge", "Dropdown", "Menu" }) |t| {
+        for ([_][]const u8{ "Label", "Button", "TextArea", "Checkbox", "RadioButton", "Toggle", "Badge", "Dropdown", "Menu", "Popover" }) |t| {
             if (std.mem.eql(u8, tag, t)) return true;
         }
         return false;
@@ -988,6 +988,8 @@ const Emitter = struct {
         "RangeSlider", "NumericStepper", "SegmentedControl", "Divider",   "ProgressBar",
         "Badge",     "Spinner",         "Panel",           "Combobox",  "Dropdown",
         "Breadcrumbs", "Menu",          "MenuBar",         "Table",     "Tree",
+        "Window",    "Dialog",          "ToastStack",      "Tabs",      "TabPanel",
+        "AccordionSection", "Card",     "Popover",
     };
 
     fn isBuiltinWidgetKind(tag: []const u8) bool {
@@ -1008,8 +1010,22 @@ const Emitter = struct {
     /// Found the hard way (2026-09-02): Stage 1's own end-to-end
     /// verification exercised `columns=`/`rows=` on Table but never
     /// `styles=` on any of these 7, so this shipped uncaught.
+    ///
+    /// Stage 2 (2026-09-02) adds 5 more, applying the exact same fix up
+    /// front this time instead of rediscovering the bug: Dialog (a
+    /// multi-field struct value, like Breadcrumbs), and ToastStack/
+    /// AccordionSection/Card/Popover (`*Struct`, like Dropdown). Each
+    /// targets whichever of its own several real widgets is visually
+    /// primary -- see each one's own `ID()` doc comment in the Go SDK.
+    /// Window and Tabs are NOT here despite being Stage 2 widgets too:
+    /// both are plain `uint32` typedefs in the real SDK source, so
+    /// `uint32(<var>)` already works for them like any Stage 1 simple
+    /// widget. TabPanel isn't a distinct Go type at all -- `CreateTabPanel`
+    /// returns a plain `Container`, uint32-based like any other.
     const struct_backed_widget_kinds = [_][]const u8{
-        "Combobox", "Dropdown", "Breadcrumbs", "Menu", "MenuBar", "Table", "Tree",
+        "Combobox", "Dropdown",   "Breadcrumbs",      "Menu", "MenuBar",
+        "Table",    "Tree",       "Dialog",           "ToastStack",
+        "AccordionSection", "Card", "Popover",
     };
 
     fn isStructBackedWidgetKind(tag: []const u8) bool {
@@ -1027,9 +1043,11 @@ const Emitter = struct {
     /// naturally-declared `ref` target variable's type would ever match).
     /// Breadcrumbs is deliberately excluded: `CreateBreadcrumbs` returns a
     /// plain value, so it needs the same `&var_name` every uint32-based
-    /// widget already gets.
+    /// widget already gets. Dialog (Stage 2) is excluded for the identical
+    /// reason -- `CreateDialog` also returns a plain value.
     const pointer_returning_widget_kinds = [_][]const u8{
-        "Combobox", "Dropdown", "Menu", "MenuBar", "Table", "Tree",
+        "Combobox",   "Dropdown", "Menu",  "MenuBar", "Table", "Tree",
+        "ToastStack", "AccordionSection", "Card", "Popover",
     };
 
     fn isPointerReturningWidgetKind(tag: []const u8) bool {
@@ -1320,6 +1338,13 @@ const Emitter = struct {
         var skip_attrs: []const []const u8 = &.{};
         var is_image_tag = false;
         var image_texture_id: u32 = undefined;
+        // Stage 2 (2026-09-02): `Card`/`AccordionSection` attach real
+        // children under a different id than their own tag's primary
+        // variable (`.ContentID()`/`.Content`) -- the exact same
+        // divergence-point `emitMarginWrapper` already established between
+        // `attach_expr` and `var_name`, just reused per-widget here.
+        // Defaults to `var_name` (every other widget's own real id).
+        var children_parent_expr: []const u8 = var_name;
         var image_styles_emitted = false;
 
         if (std.mem.eql(u8, el.tag, "Container")) {
@@ -1681,6 +1706,217 @@ const Emitter = struct {
             try self.emitExprAttrValue(row_height);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attrs = &.{ "roots", "rowHeight" };
+        } else if (std.mem.eql(u8, el.tag, "Window")) {
+            // Stage 2 (2026-09-02): no `Layout` at all -- `CreateWindow`
+            // has no ParentID/Sizing/Direction/... (a real OS window can't
+            // be a Clay child of anything, see window.go's own doc
+            // comment), so `emitLayout` is never called here. Self-closing
+            // in v1: real content goes under `.RootID()` from hand-written
+            // Go after `ref={&x}` binds it -- the same "ref-bound, content
+            // built later" posture `ToastStack`'s own `.Show()` already
+            // has, rather than inventing new parent-context-threading
+            // machinery for a widget whose "parent" isn't a Clay concept
+            // at all. A `margin` set via `styles=` on `<Window>` is a
+            // real, accepted no-op (the wrapper it would create is never
+            // actually parented to anything) -- a narrow, disclosed gap
+            // matching this file's own established posture elsewhere
+            // (e.g. `AccordionSection`'s content-layout default below),
+            // not worth special-casing for.
+            try self.rejectChildren(el);
+            const title = try self.namedTextAttr(el, "title");
+            const width = try self.requiredExprAttr(el, "width");
+            const height = try self.requiredExprAttr(el, "height");
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateWindow(");
+            if (title) |t| {
+                try self.emitNamedTextAttrValue(t);
+            } else {
+                try writeGoStringLiteral(self.out, self.allocator, "");
+            }
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(width);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(height);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "title", "width", "height" };
+        } else if (std.mem.eql(u8, el.tag, "Dialog")) {
+            // No `Layout` (geometry is hardcoded inside `CreateDialog`:
+            // 280px wide, Fit height -- see dialog.go) -- same no-`Layout`
+            // shape as `Window`/`ToastStack` above. Self-closing:
+            // `CreateDialog` builds its own title/message/button-row
+            // internally, so there's nothing for real `.ntx` children to
+            // attach to (same posture `<Image>` already has). `Dialog`
+            // returns a plain value (like `Breadcrumbs`), not a pointer --
+            // see `struct_backed_widget_kinds`'s own doc comment.
+            try self.rejectChildren(el);
+            const title = try self.namedTextAttr(el, "title");
+            const message = try self.requiredNamedTextAttr(el, "message");
+            const button_labels = try self.requiredExprAttr(el, "buttonLabels");
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateDialog(");
+            if (title) |t| {
+                try self.emitNamedTextAttrValue(t);
+            } else {
+                try writeGoStringLiteral(self.out, self.allocator, "");
+            }
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitNamedTextAttrValue(message);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(button_labels);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "title", "message", "buttonLabels" };
+        } else if (std.mem.eql(u8, el.tag, "ToastStack")) {
+            // No `Layout` (`CreateToastStack` takes only a bare `childGap`
+            // -- see toast.go). Self-closing, `ref`-bound: toasts
+            // themselves are never created via markup, only later via
+            // `.Show(...)` from hand-written Go once `ref={&x}` has bound
+            // this stack -- same posture as `Window` above.
+            try self.rejectChildren(el);
+            const child_gap = try self.requiredExprAttr(el, "childGap");
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateToastStack(");
+            try self.emitExprAttrValue(child_gap);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{"childGap"};
+        } else if (std.mem.eql(u8, el.tag, "Tabs")) {
+            // Unlike Window/Dialog/ToastStack, Tabs DOES take a real
+            // `Layout` (it's a normal Clay-parented header row) -- `Tabs`
+            // itself is a plain `uint32` typedef, not struct-backed. Real
+            // per-tab panels are separate `<TabPanel tabs={...}>` tags
+            // (below), not children of `<Tabs>` -- see that branch's own
+            // doc comment for why this pairing needed its own design
+            // rather than nesting.
+            try self.rejectChildren(el);
+            const labels = try self.requiredExprAttr(el, "labels");
+            const selected_index = try self.requiredExprAttr(el, "selectedIndex");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(32) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateTabs(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(labels);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(selected_index);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "labels", "selectedIndex" };
+        } else if (std.mem.eql(u8, el.tag, "TabPanel")) {
+            // `CreateTabPanel(tabs Tabs, layout Layout) (Container, error)`
+            // force-overwrites `layout.ParentID` with `tabs`'s own id
+            // internally, regardless of what's passed (see tabs.go) -- so
+            // `emitLayout`'s own `attach_expr`-derived ParentID line is
+            // harmless dead weight here, not wrong, and needs no special
+            // casing. `tabs=` is read specially instead of relying on
+            // `attach_expr`/positional threading -- the exact same posture
+            // `<Image src="...">` already has for its own special
+            // attribute. The returned `Container` is uint32-based like any
+            // other, so styling/ref/real nested children all work exactly
+            // like a plain `<Container>` -- no further special-casing
+            // needed past the constructor call itself.
+            const tabs = try self.requiredExprAttr(el, "tabs");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateTabPanel(");
+            try self.emitExprAttrValue(tabs);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{"tabs"};
+        } else if (std.mem.eql(u8, el.tag, "AccordionSection")) {
+            // Two separate `Layout`s (`CreateAccordionSection(headerLayout,
+            // contentLayout, ...)`, see accordion.go) -- header and
+            // Content are separate siblings under whatever container the
+            // caller parented them in, not parent-child of each other.
+            // `styles=` shapes the header only (matching Button's own
+            // default sizing, since the header really is a Button) --
+            // Content gets a fixed, undisclosed-to-styles default
+            // (TopToBottom/Grow-width/Fit-height), a deliberate v1
+            // simplification rather than exposing a second style-attribute
+            // grammar (recorded in project_natyv_ntx_widget_coverage
+            // memory before this was ever implemented). Real children
+            // attach under the exported `.Content` field (not a method,
+            // unlike `Card.ContentID()` below) -- same divergence-point
+            // reuse `children_parent_expr` exists for.
+            const title = try self.namedTextAttr(el, "title");
+            const expanded = try self.requiredExprAttr(el, "expanded");
+            const background = try self.requiredExprAttr(el, "background");
+            const header_layout_var = try std.fmt.allocPrint(self.allocator, "{s}HeaderLayout", .{var_name});
+            const content_layout_var = try std.fmt.allocPrint(self.allocator, "{s}ContentLayout", .{var_name});
+            try self.emitLayout(header_layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(content_layout_var, attach_expr, .{ .direction = "widgets.TopToBottom", .width = .{ .kind = .grow, .value = 0 }, .height = fitSizing() });
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateAccordionSection(");
+            try self.out.appendSlice(self.allocator, header_layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, content_layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            if (title) |t| {
+                try self.emitNamedTextAttrValue(t);
+            } else {
+                try writeGoStringLiteral(self.out, self.allocator, "");
+            }
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(expanded);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(background);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "title", "expanded", "background" };
+            children_parent_expr = try std.fmt.allocPrint(self.allocator, "{s}.Content", .{var_name});
+        } else if (std.mem.eql(u8, el.tag, "Card")) {
+            // Real children attach under `.ContentID()` (a method, unlike
+            // AccordionSection's `.Content` field above) -- see card.go's
+            // own doc comment. `layout` (and therefore `styles=`) shapes
+            // the outer panel, matching `CreateCard`'s own single-`Layout`
+            // shape (unlike AccordionSection's two).
+            const title = try self.namedTextAttr(el, "title");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateCard(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            if (title) |t| {
+                try self.emitNamedTextAttrValue(t);
+            } else {
+                try writeGoStringLiteral(self.out, self.allocator, "");
+            }
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{"title"};
+            children_parent_expr = try std.fmt.allocPrint(self.allocator, "{s}.ContentID()", .{var_name});
+        } else if (std.mem.eql(u8, el.tag, "Popover")) {
+            // `build func(panelID uint32) ([]uint32, error)` needs every
+            // created child's id collected and returned -- a genuinely
+            // different shape than the `func(id uint32) error` closure
+            // `emitComponentCall` already knows how to emit for a
+            // component tag's own children. Rather than build bespoke
+            // id-collecting codegen for the one widget in the whole SDK
+            // shaped this way, `<Popover>` stays self-closing in `.ntx`:
+            // `build={realGoClosureLiteral}` is a plain expr attribute,
+            // same "when `.ntx` has no clean mapping, a raw closure
+            // attribute does the job" posture `onClick={...}` already has.
+            // Trigger label is child text/`text=`, same convention
+            // Menu/Dropdown's own trigger already uses (see
+            // `consumesTextChildren`).
+            const panel_width = try self.requiredExprAttr(el, "panelWidth");
+            const build = try self.requiredExprAttr(el, "build");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreatePopover(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitWidgetText(el);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(panel_width);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(build);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "text", "panelWidth", "build" };
         } else if (std.mem.eql(u8, el.tag, "Image")) {
             // `background: true` (not false) is required -- Container's
             // own fillRect() dispatch returns null entirely when
@@ -1768,8 +2004,8 @@ const Emitter = struct {
             for (el.children) |child| {
                 switch (child) {
                     .text => return self.fail(el.line, el.col, "<{s}> doesn't accept text content", .{el.tag}),
-                    .element => |child_el| _ = try self.emitElement(child_el, var_name),
-                    .raw_code => |raw| try self.emitRawCodeBlock(raw, var_name),
+                    .element => |child_el| _ = try self.emitElement(child_el, children_parent_expr),
+                    .raw_code => |raw| try self.emitRawCodeBlock(raw, children_parent_expr),
                 }
             }
         }
@@ -2910,7 +3146,7 @@ test "a bare tag resolved via 'uses' compiles to a qualified cross-package compo
 test "two 'uses'-bound tags sharing one path only add that import once" {
     const src =
         \\uses (
-        \\  { Card, UserCard } from "natyv/ntx-components-guest/components"
+        \\  { InfoCard, UserCard } from "natyv/ntx-components-guest/components"
         \\)
         \\
         \\expose Foo
@@ -2918,7 +3154,7 @@ test "two 'uses'-bound tags sharing one path only add that import once" {
         \\func Foo(parent widgets.Container) error {
         \\  <Container>
         \\    <UserCard/>
-        \\    <Card><Label>hi</Label></Card>
+        \\    <InfoCard><Label>hi</Label></InfoCard>
         \\  </Container>
         \\}
     ;
@@ -2937,7 +3173,7 @@ test "two 'uses'-bound tags sharing one path only add that import once" {
     }
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expect(std.mem.indexOf(u8, gen, "components.UserCard(uint32(Container0))") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gen, "components.Card(uint32(Container0), func(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "components.InfoCard(uint32(Container0), func(") != null);
 }
 
 test "a component tag not referenced by any composer body adds no unused import" {
@@ -2965,15 +3201,15 @@ test "a component tag not referenced by any composer body adds no unused import"
 test "children of a 'uses'-bound component tag compile to a trailing widgets.Builder closure" {
     const src =
         \\uses (
-        \\  { Card } from "natyv/ntx-components-guest/components"
+        \\  { InfoCard } from "natyv/ntx-components-guest/components"
         \\)
         \\
         \\expose Foo
         \\
         \\func Foo(parent widgets.Container) error {
-        \\  <Card>
+        \\  <InfoCard>
         \\    <Label>hi</Label>
-        \\  </Card>
+        \\  </InfoCard>
         \\}
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2983,7 +3219,7 @@ test "children of a 'uses'-bound component tag compile to a trailing widgets.Bui
     const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
-    try std.testing.expect(std.mem.indexOf(u8, gen, "if err := components.Card(uint32(parent), func(p0 uint32) error {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "if err := components.InfoCard(uint32(parent), func(p0 uint32) error {") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateLabel(Label1Layout, \"hi\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "Label1Layout := widgets.ParentID(uint32(p0))") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "\treturn nil\n\t}); err != nil {\n\t\treturn err\n\t}\n") != null);
@@ -3035,15 +3271,15 @@ test "an onXxx-named attribute on a component tag forwards as a plain prop, not 
 test "styles on a component tag only applies its margin-wrapping effect, never forwarded as an arg" {
     const src =
         \\uses (
-        \\  { Card } from "natyv/ntx-components-guest/components"
+        \\  { InfoCard } from "natyv/ntx-components-guest/components"
         \\)
         \\
         \\expose Foo
         \\
         \\func Foo(parent widgets.Container) error {
-        \\  <Card styles={spacer}>
+        \\  <InfoCard styles={spacer}>
         \\    <Label>hi</Label>
-        \\  </Card>
+        \\  </InfoCard>
         \\}
     ;
     const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "spacer", .margin = 16 }};
@@ -3055,7 +3291,7 @@ test "styles on a component tag only applies its margin-wrapping effect, never f
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "Margin0Layout.Padding = widgets.Padding{Left: 16, Right: 16, Top: 16, Bottom: 16}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gen, "if err := components.Card(uint32(Margin0), func(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "if err := components.InfoCard(uint32(Margin0), func(") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "\"spacer\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "ApplyStyle") == null);
 }
@@ -3782,4 +4018,166 @@ test "<Tree roots={} rowHeight={} /> forwards both real args" {
     const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Tree roots={nodes} rowHeight={24} />\n}\n");
     try std.testing.expect(r.err == null);
     try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateTree(Tree0Layout, nodes, 24)") != null);
+}
+
+// Stage 2 (2026-09-02): Window, Dialog, ToastStack, Tabs, TabPanel,
+// AccordionSection, Card, Popover.
+
+test "<Window title=\"...\" width={} height={} /> has no Layout line at all" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Window title=\"Settings\" width={400} height={300} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateWindow(\"Settings\", 400, 300)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "Window0Layout") == null);
+}
+
+test "<Window/> without title defaults to an empty string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Window width={400} height={300} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateWindow(\"\", 400, 300)") != null);
+}
+
+test "<Window> rejects children" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Window width={400} height={300}><Label>hi</Label></Window>\n}\n");
+    try std.testing.expect(r.generated == null);
+    try std.testing.expect(r.err != null);
+}
+
+test "<Dialog title=\"...\" message=\"...\" buttonLabels={} /> forwards all three, no Layout line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Dialog title=\"Confirm\" message=\"Are you sure?\" buttonLabels={labels} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateDialog(\"Confirm\", \"Are you sure?\", labels)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "Dialog0Layout") == null);
+}
+
+test "<Dialog styles={...}/> targets .ID() -- Dialog returns a plain value, still not uint32-based" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const src = "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Dialog styles={nav} message=\"Hi\" buttonLabels={labels} />\n}\n";
+    const found = try Expose.findComposers(allocator, src);
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "nav", .background_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } }};
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyle(Dialog0.ID(), StyleTokens, \"nav\")") != null);
+}
+
+test "<ToastStack ref={&x} childGap={8} /> assigns the already-pointer var directly, no extra &" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <ToastStack ref={&myStack} childGap={8} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateToastStack(8)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myStack = ToastStack0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myStack = &ToastStack0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "ToastStack0Layout") == null);
+}
+
+test "<Tabs labels={} selectedIndex={} /> DOES emit a real Layout line, unlike Window/Dialog/ToastStack" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Tabs labels={tabLabels} selectedIndex={0} />\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "Tabs0Layout := widgets.ParentID(uint32(parent))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateTabs(Tabs0Layout, tabLabels, 0)") != null);
+}
+
+test "<TabPanel tabs={...}> real nested children attach normally, tabs= isn't forwarded as a plain attribute" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <TabPanel tabs={myTabs}><Label>hi</Label></TabPanel>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateTabPanel(myTabs, TabPanel0Layout)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "Label1Layout := widgets.ParentID(uint32(TabPanel0))") != null);
+}
+
+test "<TabPanel> without tabs= is a clear error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <TabPanel></TabPanel>\n}\n");
+    try std.testing.expect(r.generated == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err.?.message, "tabs") != null);
+}
+
+test "<AccordionSection> emits two separate Layouts and attaches children under .Content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <AccordionSection title=\"Details\" expanded={true} background={false}><Label>hi</Label></AccordionSection>\n}\n");
+    try std.testing.expect(r.err == null);
+    const gen = r.generated.?;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "AccordionSection0HeaderLayout := widgets.ParentID(uint32(parent))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "AccordionSection0ContentLayout := widgets.ParentID(uint32(parent))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateAccordionSection(AccordionSection0HeaderLayout, AccordionSection0ContentLayout, \"Details\", true, false)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Label1Layout := widgets.ParentID(uint32(AccordionSection0.Content))") != null);
+}
+
+test "<AccordionSection styles={...}/> shapes the header only, targeting .ID() (the header)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const src = "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <AccordionSection styles={nav} expanded={true} background={false} />\n}\n";
+    const found = try Expose.findComposers(allocator, src);
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "nav", .width = .{ .kind = .fixed, .value = 200 } }};
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "AccordionSection0HeaderLayout.Sizing = widgets.Sizing{Width: widgets.Fixed(200)") != null);
+    // Content gets its own fixed default (Grow width, not the header's
+    // styled 200px) -- styles= never reaches it, per this widget's own
+    // documented v1 scope-narrowing.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "AccordionSection0ContentLayout.Sizing = widgets.Sizing{Width: widgets.Grow(), Height: widgets.Fit()}") != null);
+}
+
+test "<Card title=\"...\"> attaches children under .ContentID()" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Card title=\"Engine\"><Label>hi</Label></Card>\n}\n");
+    try std.testing.expect(r.err == null);
+    const gen = r.generated.?;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateCard(Card0Layout, \"Engine\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Label1Layout := widgets.ParentID(uint32(Card0.ContentID()))") != null);
+}
+
+test "<Card/> without title defaults to an empty string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Card></Card>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateCard(Card0Layout, \"\")") != null);
+}
+
+test "<Card styles={...}/> targets .ID(), distinct from .ContentID()" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const src = "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Card styles={nav}></Card>\n}\n";
+    const found = try Expose.findComposers(allocator, src);
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "nav", .background_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } }};
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyle(Card0.ID(), StyleTokens, \"nav\")") != null);
+}
+
+test "<Popover>Open</Popover> uses child text as the trigger label, forwards panelWidth/build" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Popover panelWidth={200} build={buildPanel}>Open</Popover>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreatePopover(Popover0Layout, \"Open\", 200, buildPanel)") != null);
+}
+
+test "<Popover ref={&x}/> assigns the already-pointer var directly, no extra &" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Popover ref={&myPopover} panelWidth={200} build={buildPanel}>Open</Popover>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myPopover = Popover0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myPopover = &Popover0") == null);
 }
