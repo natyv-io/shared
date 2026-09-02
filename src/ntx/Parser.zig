@@ -519,7 +519,16 @@ pub const Parser = struct {
             const text_start_line = self.line;
             const text_start_col = self.col;
             while (self.peek()) |b| {
-                if (b == '<') break;
+                // Only a '<' that actually starts one of the three forms
+                // above (closing tag / raw-code block / element) ends the
+                // text run -- a bare '<' followed by anything else (e.g.
+                // "< Back", or "<3") is just ordinary text content. Real,
+                // confirmed infinite-loop bug fixed here (2026-09-02):
+                // breaking on *any* '<' meant a lone non-markup '<' at the
+                // very start of a text run produced a zero-length text
+                // slice and left `self.pos` untouched, so the outer loop
+                // above re-entered this exact same state forever.
+                if (b == '<' and (self.peekAt(1) == '/' or self.peekAt(1) == '%' or (self.peekAt(1) != null and isIdentStart(self.peekAt(1).?)))) break;
                 self.advance();
             }
             const raw = self.src[text_start..self.pos];
@@ -986,4 +995,31 @@ test "multiple known tags splice in as separate segments, each with real content
     try std.testing.expectEqualStrings("A", raw.segments[0].tag.tag);
     try std.testing.expectEqualStrings("text", raw.segments[1].code);
     try std.testing.expectEqualStrings("B", raw.segments[2].tag.tag);
+}
+
+test "literal child text starting with '< ' (not markup) parses instead of hanging forever" {
+    // Real, confirmed bug (2026-09-02, found via mail-natyv's own "< Back"
+    // button label): a '<' followed by anything that isn't '/', '%', or an
+    // identifier-start byte isn't the start of any of parseChildren's three
+    // recognized forms, so it's just ordinary text -- but the old text-scan
+    // loop broke on *any* '<' without ever consuming it, making zero
+    // forward progress and looping forever. This used to hang the test
+    // runner; it must now return promptly with the literal text intact.
+    const src = "<Button>< Back</Button>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    const node = try parser.parseTopLevel();
+    try std.testing.expectEqual(@as(usize, 1), node.element.children.len);
+    try std.testing.expectEqualStrings("< Back", node.element.children[0].text.text);
+}
+
+test "a bare '<' followed by a digit (not markup) is also just literal text" {
+    const src = "<Label>a<3</Label>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    const node = try parser.parseTopLevel();
+    try std.testing.expectEqual(@as(usize, 1), node.element.children.len);
+    try std.testing.expectEqualStrings("a<3", node.element.children[0].text.text);
 }
