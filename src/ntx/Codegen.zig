@@ -387,6 +387,7 @@ const Emitter = struct {
                     try text.appendSlice(self.allocator, t.text);
                 },
                 .element => return self.fail(el.line, el.col, "<{s}> doesn't accept nested elements", .{el.tag}),
+                .raw_code => return self.fail(el.line, el.col, "<{s}> doesn't accept a '<%...%>' block -- use text={{expr}} for dynamic text instead", .{el.tag}),
             }
         }
         const combined = try text.toOwnedSlice(self.allocator);
@@ -824,8 +825,20 @@ const Emitter = struct {
         return wrap_var;
     }
 
+    /// The real, complete set of built-in widget kind names -- the single
+    /// source of truth `isBuiltinWidgetKind` checks against, and (2026-09-01)
+    /// also what `generateGo`'s own `known_tags` registry starts from for
+    /// a `<%...%>` block's speculative tag-parse. One list, not two kept
+    /// in sync by hand -- avoids exactly the kind of drift this project
+    /// already added a dedicated regression test for once before
+    /// (`BindingsHostFnUtil.zig`).
+    pub const builtin_widget_kinds = [_][]const u8{ "Container", "Label", "Button", "TextField", "Image" };
+
     fn isBuiltinWidgetKind(tag: []const u8) bool {
-        return std.mem.eql(u8, tag, "Container") or std.mem.eql(u8, tag, "Label") or std.mem.eql(u8, tag, "Button") or std.mem.eql(u8, tag, "TextField") or std.mem.eql(u8, tag, "Image");
+        for (builtin_widget_kinds) |kind| {
+            if (std.mem.eql(u8, tag, kind)) return true;
+        }
+        return false;
     }
 
     /// Stage 6a (component reuse), bare-name resolution only -- an
@@ -965,6 +978,10 @@ const Emitter = struct {
                         self.err = child_emitter.err;
                         return e;
                     },
+                    .raw_code => |raw| child_emitter.emitRawCodeBlock(raw, child_var) catch |e| {
+                        self.err = child_emitter.err;
+                        return e;
+                    },
                 }
             }
             self.counter = child_emitter.counter;
@@ -1027,6 +1044,33 @@ const Emitter = struct {
         try self.out.appendSlice(self.allocator, parent_expr);
         try self.out.appendSlice(self.allocator, ")); err != nil {\n\t\treturn err\n\t}\n");
         return "children";
+    }
+
+    /// `<%...%>` raw-code block (2026-09-01, natyv's `.ntx` dynamic-
+    /// content work): walks `node.segments`, appending each `.code`
+    /// segment verbatim into `self.out` -- never `writeGoStringLiteral`-
+    /// escaped, since this is real host-language code, not a Go string --
+    /// and recursively calling `emitElement` for each `.tag` segment,
+    /// splicing its generated call inline at that exact point. This is
+    /// the whole mechanism: real host control flow (loops, conditionals,
+    /// anything) with real natyv elements spliced directly inside it,
+    /// parented at the same `parent_expr` the block's own parent tag
+    /// resolved to.
+    ///
+    /// Deliberate, documented gap: unlike every other braced attribute
+    /// (`onClick={...}`, `text={...}`, etc.), the raw code *text* itself
+    /// gets no `SourceMapping`/hover support of its own -- there's no
+    /// single identifier to point at the way a handler expression has,
+    /// since this can be an arbitrary multi-statement block. A `.tag`
+    /// segment's own nested elements still get full, real mapping via the
+    /// ordinary `emitElement` recursion below, unaffected by this gap.
+    fn emitRawCodeBlock(self: *Emitter, node: Parser.RawCodeNode, parent_expr: []const u8) EmitError!void {
+        for (node.segments) |segment| {
+            switch (segment) {
+                .code => |code| try self.out.appendSlice(self.allocator, code),
+                .tag => |tag_el| _ = try self.emitElement(tag_el, parent_expr),
+            }
+        }
     }
 
     fn emitElement(self: *Emitter, el: Parser.Element, parent_expr: []const u8) EmitError![]const u8 {
@@ -1203,6 +1247,7 @@ const Emitter = struct {
                 switch (child) {
                     .text => return self.fail(el.line, el.col, "<{s}> doesn't accept text content", .{el.tag}),
                     .element => |child_el| _ = try self.emitElement(child_el, var_name),
+                    .raw_code => |raw| try self.emitRawCodeBlock(raw, var_name),
                 }
             }
         }
@@ -1306,6 +1351,18 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
     errdefer composer_names.deinit(allocator);
     for (composers) |c| try composer_names.append(allocator, c.name);
 
+    // The complete `known_tags` registry (2026-09-01) a `<%...%>` block's
+    // speculative tag-parse checks against before attempting real tag
+    // grammar -- every built-in widget kind, every same-file composer
+    // name, and every `uses`-imported name, mirroring exactly what
+    // `Emitter.isComponentTag` already treats as a real, callable tag
+    // everywhere else in this file.
+    var known_tags: std.ArrayList([]const u8) = .empty;
+    errdefer known_tags.deinit(allocator);
+    try known_tags.appendSlice(allocator, &Emitter.builtin_widget_kinds);
+    try known_tags.appendSlice(allocator, composer_names.items);
+    for (uses) |u| try known_tags.append(allocator, u.name);
+
     // Every `uses` path actually referenced by a component-tag call
     // anywhere in this file's composers, shared across every `Emitter`
     // instance (including nested ones created for a `widgets.Builder`
@@ -1334,6 +1391,7 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
         }
 
         var body_parser = Parser.Parser.init(allocator, composer.body);
+        body_parser.known_tags = known_tags.items;
         const node = body_parser.parseTopLevel() catch |e| {
             if (e == error.ParseError) {
                 const perr = body_parser.last_error.?;
@@ -2766,3 +2824,111 @@ test "text={expr} records a real .dynamic_text SourceMapping at the expression's
     }
     try std.testing.expect(found_mapping);
 }
+
+test "<%...%> emits real code verbatim with a built-in widget's real call spliced inline" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Container>
+        \\    <%
+        \\      for _, msg := range messages {
+        \\        <Label text={msg.From} />
+        \\      }
+        \\    %>
+        \\  </Container>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    // The real loop header/footer, pasted verbatim, not re-synthesized.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "for _, msg := range messages {") != null);
+    // The real spliced widget call, using the loop's own `msg` variable.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateLabel(Label1Layout, msg.From)") != null);
+}
+
+test "<%...%> can call another exposed composer from the same file inline" {
+    const src =
+        \\expose Foo
+        \\expose MessageRow
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Container>
+        \\    <%
+        \\      for _, msg := range messages {
+        \\        <MessageRow from={msg.From} />
+        \\      }
+        \\    %>
+        \\  </Container>
+        \\}
+        \\
+        \\func MessageRow(parent uint32, from string) error {
+        \\  <Label text={from} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "for _, msg := range messages {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "MessageRow(uint32(Container0), msg.From)") != null);
+}
+
+test "<%...%> can call a 'uses'-imported component inline, and its import gets added" {
+    const src =
+        \\uses (
+        \\  { MessageRow } from "some/pkg"
+        \\)
+        \\
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Container>
+        \\    <%
+        \\      for _, msg := range messages {
+        \\        <MessageRow from={msg.From} />
+        \\      }
+        \\    %>
+        \\  </Container>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pkg.MessageRow(uint32(Container0), msg.From)") != null);
+}
+
+test "<%...%> an unregistered tag-shaped name inside raw code round-trips as plain code, not a bogus component call" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Container>
+        \\    <%
+        \\      ok := a < NotARealTag(b)
+        \\    %>
+        \\  </Container>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "ok := a < NotARealTag(b)") != null);
+}
+

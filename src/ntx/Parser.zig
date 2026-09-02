@@ -38,6 +38,7 @@
 //!                child node.
 
 const std = @import("std");
+const Lexer = @import("Lexer.zig");
 
 pub const AttrValue = union(enum) {
     /// A plain, non-braced `attr="literal"` value -- the raw text between
@@ -122,9 +123,32 @@ pub const TextNode = struct {
     col: u32,
 };
 
+/// One segment of a `<%...%>` raw-code block (2026-09-01, natyv's `.ntx`
+/// dynamic-content work) -- either a run of opaque host-language code
+/// text, or a real `<Tag>` element found via speculative/backtracking
+/// parsing (see `Parser.parseRawCodeBlock`). Never a `.text` node: a
+/// widget's own literal child text has no meaning inside real code.
+pub const RawCodeSegment = union(enum) {
+    code: []const u8,
+    tag: Element,
+};
+
+/// A `<%...%>` raw-code child -- real host-language code (loops,
+/// conditionals, arbitrary control flow) with zero or more real elements
+/// spliced inline. See [[natyv_ntx_dynamic_content_design]] (project
+/// memory) for the full design and why this exists alongside `each=`/
+/// `if=`-style attribute sugar being rejected in favor of this single,
+/// more general mechanism.
+pub const RawCodeNode = struct {
+    segments: []RawCodeSegment,
+    line: u32,
+    col: u32,
+};
+
 pub const Node = union(enum) {
     element: Element,
     text: TextNode,
+    raw_code: RawCodeNode,
 };
 
 pub const ParseError = struct {
@@ -143,21 +167,38 @@ pub const Parser = struct {
     /// a real position + message, matching Stylesheet.zig's own
     /// `last_error` convention.
     last_error: ?ParseError = null,
+    /// Every valid tag name a `<%...%>` block's speculative tag-parse may
+    /// treat as a real component call -- built-in widget kinds plus every
+    /// `expose`d composer/`uses`-imported name the caller already knows
+    /// about (2026-09-01). Empty by default, so every existing call site
+    /// and test (which never parses a `<%...%>` block) is unaffected.
+    /// This is a deliberate, real widening of this file's own documented
+    /// scope boundary (see the doc comment at the top of this file) --
+    /// `Parser` previously never needed cross-composer knowledge at all;
+    /// it does now, specifically to reject a false-positive tag-open
+    /// cheaply (e.g. Rust's `Vec<Foo>`) before attempting real tag
+    /// grammar, rather than guessing from shape alone.
+    known_tags: []const []const u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator, src: []const u8) Parser {
         return .{ .allocator = allocator, .src = src };
     }
 
-    fn peek(self: Parser) ?u8 {
+    /// `pub`, along with `peekAt`/`advance`/`fail` below: `Lexer.zig`'s
+    /// scan functions are generic (`anytype`) over any cursor-shaped type
+    /// with this exact method set, so it can call them cross-file on a
+    /// `*Parser` -- see that file's own doc comment for why it exists as
+    /// a separate file at all.
+    pub fn peek(self: Parser) ?u8 {
         return if (self.pos < self.src.len) self.src[self.pos] else null;
     }
 
-    fn peekAt(self: Parser, offset: usize) ?u8 {
+    pub fn peekAt(self: Parser, offset: usize) ?u8 {
         const i = self.pos + offset;
         return if (i < self.src.len) self.src[i] else null;
     }
 
-    fn advance(self: *Parser) void {
+    pub fn advance(self: *Parser) void {
         if (self.pos >= self.src.len) return;
         if (self.src[self.pos] == '\n') {
             self.line += 1;
@@ -168,7 +209,7 @@ pub const Parser = struct {
         self.pos += 1;
     }
 
-    fn fail(self: *Parser, line: u32, col: u32, comptime fmt: []const u8, args: anytype) error{ParseError} {
+    pub fn fail(self: *Parser, line: u32, col: u32, comptime fmt: []const u8, args: anytype) error{ParseError} {
         self.last_error = .{
             .line = line,
             .col = col,
@@ -299,37 +340,11 @@ pub const Parser = struct {
         self.skipWhitespace();
 
         const value: AttrValue = switch (self.peek() orelse return self.failHere("expected a value for attribute '{s}'", .{name})) {
-            '"' => .{ .string_literal = try self.scanQuotedString() },
+            '"' => .{ .string_literal = try Lexer.scanQuotedString(self, .go) },
             '{' => try self.parseBracedAttrValue(name),
             else => return self.failHere("expected '\"' or '{{' for attribute '{s}'", .{name}),
         };
         return .{ .name = name, .value = value, .line = name_line, .col = name_col };
-    }
-
-    /// Scans a double-quoted Go string literal starting at the opening
-    /// `"`, returning the raw (unescaped) content between the quotes.
-    /// Escape-aware only enough to find the real closing quote -- `\"`
-    /// never ends the literal early -- never interprets what an escape
-    /// means, same "store raw source bytes" choice as the returned value.
-    fn scanQuotedString(self: *Parser) error{ParseError}![]const u8 {
-        const quote_line = self.line;
-        const quote_col = self.col;
-        self.advance(); // consume opening '"'
-        const start = self.pos;
-        while (self.peek()) |b| {
-            if (b == '"') {
-                const content = self.src[start..self.pos];
-                self.advance();
-                return content;
-            }
-            if (b == '\\' and self.peekAt(1) != null) {
-                self.advance();
-                self.advance();
-                continue;
-            }
-            self.advance();
-        }
-        return self.fail(quote_line, quote_col, "unterminated string literal", .{});
     }
 
     fn parseBracedAttrValue(self: *Parser, attr_name: []const u8) error{ ParseError, OutOfMemory }!AttrValue {
@@ -424,10 +439,11 @@ pub const Parser = struct {
 
     /// Scans opaque host-language text from the current position (right
     /// after a consumed `{`) through its matching `}`, tracking brace
-    /// depth and skipping over the contents of Go string/raw-string/rune
-    /// literals and `//`/`/* */` comments so a `}` inside any of those
-    /// never closes the block early. Never inspects parens/brackets --
-    /// unnecessary for finding the matching `}`, since valid Go can't
+    /// depth and delegating to `Lexer.zig` (2026-09-01, extracted from
+    /// this function) to skip over the contents of Go string/raw-string/
+    /// rune literals and `//`/`/* */` comments so a `}` inside any of
+    /// those never closes the block early. Never inspects parens/brackets
+    /// -- unnecessary for finding the matching `}`, since valid Go can't
     /// interleave mismatched bracket kinds. Returns the end offset
     /// (exclusive) of the opaque span; the matching `}` itself is
     /// consumed but not included in that span.
@@ -458,61 +474,14 @@ pub const Parser = struct {
                     }
                     self.advance();
                 },
-                '"' => _ = try self.scanQuotedString(),
-                '`' => try self.scanRawString(),
-                '\'' => try self.scanRuneLiteral(),
-                '/' => {
-                    if (self.peekAt(1) == '/') {
-                        while (self.peek()) |c| {
-                            if (c == '\n') break;
-                            self.advance();
-                        }
-                    } else if (self.peekAt(1) == '*') {
-                        self.advance();
-                        self.advance();
-                        while (self.peek()) |_| {
-                            if (self.peek() == '*' and self.peekAt(1) == '/') {
-                                self.advance();
-                                self.advance();
-                                break;
-                            }
-                            self.advance();
-                        }
-                    } else {
-                        self.advance();
-                    }
-                },
+                '"' => _ = try Lexer.scanQuotedString(self, .go),
+                '`' => try Lexer.scanRawString(self, .go),
+                '\'' => try Lexer.scanRuneLiteral(self, .go),
+                '/' => Lexer.skipSlash(self, .go),
                 else => self.advance(),
             }
         }
         return self.fail(open_line, open_col, "unterminated '{{' (missing matching '}}')", .{});
-    }
-
-    fn scanRawString(self: *Parser) error{ParseError}!void {
-        const line = self.line;
-        const col = self.col;
-        self.advance(); // opening '`'
-        while (self.peek()) |b| {
-            self.advance();
-            if (b == '`') return;
-        }
-        return self.fail(line, col, "unterminated raw string literal", .{});
-    }
-
-    fn scanRuneLiteral(self: *Parser) error{ParseError}!void {
-        const line = self.line;
-        const col = self.col;
-        self.advance(); // opening '\''
-        while (self.peek()) |b| {
-            if (b == '\\' and self.peekAt(1) != null) {
-                self.advance();
-                self.advance();
-                continue;
-            }
-            self.advance();
-            if (b == '\'') return;
-        }
-        return self.fail(line, col, "unterminated rune literal", .{});
     }
 
     fn parseChildren(self: *Parser, open_tag: []const u8) error{ ParseError, OutOfMemory }!struct { children: []Node, close_line: u32, close_col: u32 } {
@@ -534,6 +503,11 @@ pub const Parser = struct {
                 self.skipWhitespace();
                 try self.expectByte('>');
                 return .{ .children = try children.toOwnedSlice(self.allocator), .close_line = close_line, .close_col = close_col };
+            }
+
+            if (self.peek() == '<' and self.peekAt(1) == '%') {
+                try children.append(self.allocator, .{ .raw_code = try self.parseRawCodeBlock() });
+                continue;
             }
 
             if (self.peek() == '<' and self.peekAt(1) != null and isIdentStart(self.peekAt(1).?)) {
@@ -568,6 +542,134 @@ pub const Parser = struct {
                     }
                 }
                 try children.append(self.allocator, .{ .text = .{ .text = trimmed, .line = line, .col = col } });
+            }
+        }
+    }
+
+    /// Peeks (without consuming anything) the tag name that would start
+    /// right at the current `<` position, if any -- mirrors
+    /// `parseTagName`'s own grammar (a plain identifier, optionally
+    /// dotted) but via pure lookahead (`peekAt`, never `advance`), so a
+    /// cheap `known_tags` check (see `isKnownTag`) can happen before
+    /// committing to a real, snapshot-requiring `parseElement()` attempt
+    /// inside `parseRawCodeBlock`. Returns `null` if the position isn't
+    /// even shaped like a tag-name start (e.g. `<` followed by a digit or
+    /// operator character, as in a real comparison).
+    fn peekTagName(self: *Parser) ?[]const u8 {
+        if (self.peek() != '<') return null;
+        var i: usize = 1;
+        const first = self.peekAt(i) orelse return null;
+        if (!isIdentStart(first)) return null;
+        i += 1;
+        while (self.peekAt(i)) |c| {
+            if (!isIdentCont(c)) break;
+            i += 1;
+        }
+        if (self.peekAt(i) == '.') {
+            const dot_i = i;
+            const after_dot = self.peekAt(i + 1) orelse return self.src[self.pos + 1 .. self.pos + i];
+            if (isIdentStart(after_dot)) {
+                i += 2;
+                while (self.peekAt(i)) |c| {
+                    if (!isIdentCont(c)) break;
+                    i += 1;
+                }
+            } else {
+                i = dot_i;
+            }
+        }
+        return self.src[self.pos + 1 .. self.pos + i];
+    }
+
+    /// Whether `name` is a real, known tag -- see `known_tags`'s own doc
+    /// comment for what populates this and why.
+    fn isKnownTag(self: *Parser, name: []const u8) bool {
+        for (self.known_tags) |t| {
+            if (std.mem.eql(u8, t, name)) return true;
+        }
+        return false;
+    }
+
+    /// `<%...%>` raw-code escape (2026-09-01, natyv's `.ntx`
+    /// dynamic-content work): a child position that's real host-language
+    /// code instead of markup, with zero or more real `<Tag>` elements
+    /// spliced inline via speculative/backtracking parsing. Starts right
+    /// at the `<` of `<%` (mirrors `parseElement`'s own convention,
+    /// called from `parseChildren` the same way); consumes through the
+    /// matching `%>`, delegating to `Lexer.zig` for the same
+    /// string/comment-aware scanning `scanUntilMatchingBrace` already
+    /// uses (so a `%` or `<` sitting inside a Go string/comment never
+    /// confuses this scan either).
+    ///
+    /// At every candidate `<Identifier` found along the way: `peekTagName`
+    /// + `isKnownTag` cheaply rejects anything not a real, known tag name
+    /// (e.g. Rust's `Vec<Foo>` inside code that will eventually target a
+    /// Rust backend) without ever attempting real tag grammar. Only a
+    /// known name gets a real attempt: snapshot the cursor (same
+    /// restore-on-failure trick `tryParseStylesList` already uses), try
+    /// `parseElement()`; on success, splice a `.tag` segment and resume
+    /// scanning right after it; on failure (a real `ParseError`, not
+    /// `OutOfMemory`, which still propagates), restore the snapshot and
+    /// fall back to treating that `<` as ordinary code text.
+    ///
+    /// No nesting: a second, unescaped `<%` before this one's matching
+    /// `%>` is a clear parse error rather than silently supported --
+    /// simplest correct v1 behavior (see
+    /// [[natyv_ntx_dynamic_content_design]], project memory, for why this
+    /// was left an open question rather than designed further up front).
+    fn parseRawCodeBlock(self: *Parser) error{ ParseError, OutOfMemory }!RawCodeNode {
+        const start_line = self.line;
+        const start_col = self.col;
+        self.advance(); // '<'
+        self.advance(); // '%'
+
+        var segments: std.ArrayList(RawCodeSegment) = .empty;
+        errdefer segments.deinit(self.allocator);
+
+        var code_start = self.pos;
+
+        while (true) {
+            const b = self.peek() orelse return self.fail(start_line, start_col, "unterminated '<%' (missing matching '%>')", .{});
+
+            if (b == '%' and self.peekAt(1) == '>') {
+                if (self.pos > code_start) {
+                    try segments.append(self.allocator, .{ .code = self.src[code_start..self.pos] });
+                }
+                self.advance(); // '%'
+                self.advance(); // '>'
+                return .{ .segments = try segments.toOwnedSlice(self.allocator), .line = start_line, .col = start_col };
+            }
+
+            if (b == '<' and self.peekAt(1) == '%') {
+                return self.fail(self.line, self.col, "nested '<%' isn't supported -- close this one with '%>' first", .{});
+            }
+
+            if (b == '<') {
+                if (self.peekTagName()) |name| {
+                    if (self.isKnownTag(name)) {
+                        const snapshot = self.*;
+                        const tag_start = self.pos;
+                        if (self.parseElement()) |node| {
+                            if (tag_start > code_start) {
+                                try segments.append(self.allocator, .{ .code = self.src[code_start..tag_start] });
+                            }
+                            try segments.append(self.allocator, .{ .tag = node.element });
+                            code_start = self.pos;
+                            continue;
+                        } else |err| {
+                            if (err != error.ParseError) return err;
+                            self.* = snapshot;
+                        }
+                    }
+                }
+            }
+
+            switch (b) {
+                '"' => _ = try Lexer.scanQuotedString(self, .go),
+                '`' => try Lexer.scanRawString(self, .go),
+                '\'' => try Lexer.scanRuneLiteral(self, .go),
+                '/' => Lexer.skipSlash(self, .go),
+                else => self.advance(),
             }
         }
     }
@@ -773,4 +875,115 @@ test "reports a clear error on a mismatched dotted closing tag" {
     var parser = Parser.init(arena.allocator(), src);
     try std.testing.expectError(error.ParseError, parser.parseTopLevel());
     try std.testing.expect(std.mem.indexOf(u8, parser.last_error.?.message, "components.OtherThing") != null);
+}
+
+test "<%...%> with no tags at all produces a single opaque code segment" {
+    const src = "<Container><% total := total + 1 %></Container>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    const node = try parser.parseTopLevel();
+    try std.testing.expectEqual(@as(usize, 1), node.element.children.len);
+    const raw = node.element.children[0].raw_code;
+    try std.testing.expectEqual(@as(usize, 1), raw.segments.len);
+    try std.testing.expectEqualStrings(" total := total + 1 ", raw.segments[0].code);
+}
+
+test "<%...%> splices a known tag inline as a real .tag segment, not opaque text" {
+    const src = "<Container><% for _, msg := range messages { <MessageRow from={msg.From} /> } %></Container>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    parser.known_tags = &.{"MessageRow"};
+    const node = try parser.parseTopLevel();
+    const raw = node.element.children[0].raw_code;
+    try std.testing.expectEqual(@as(usize, 3), raw.segments.len);
+    try std.testing.expectEqualStrings(" for _, msg := range messages { ", raw.segments[0].code);
+    try std.testing.expectEqualStrings("MessageRow", raw.segments[1].tag.tag);
+    try std.testing.expectEqualStrings("from", raw.segments[1].tag.attrs[0].name);
+    try std.testing.expectEqualStrings(" } ", raw.segments[2].code);
+}
+
+test "<%...%> treats an unregistered tag-shaped name as ordinary code, never attempting to parse it" {
+    const src = "<Container><% x := a < Foo(y) %></Container>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    // known_tags left empty -- "Foo" is never registered.
+    const node = try parser.parseTopLevel();
+    const raw = node.element.children[0].raw_code;
+    try std.testing.expectEqual(@as(usize, 1), raw.segments.len);
+    try std.testing.expectEqualStrings(" x := a < Foo(y) ", raw.segments[0].code);
+}
+
+test "<%...%> backtracks cleanly when a known tag name fails real tag grammar" {
+    // "Foo" is registered, but what follows isn't well-formed tag syntax
+    // (no closing '>' or '/>' before the real code resumes) -- the
+    // speculative parse must fail and fall back to code text rather than
+    // corrupting the rest of the scan.
+    const src = "<Container><% x := a < Foo(y) %></Container>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    parser.known_tags = &.{"Foo"};
+    const node = try parser.parseTopLevel();
+    const raw = node.element.children[0].raw_code;
+    try std.testing.expectEqual(@as(usize, 1), raw.segments.len);
+    try std.testing.expectEqualStrings(" x := a < Foo(y) ", raw.segments[0].code);
+}
+
+test "<%...%> a % or < sitting inside a real Go string doesn't confuse the scan" {
+    const src = "<Container><% fmt.Println(\"100% done <Foo>\") %></Container>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    parser.known_tags = &.{"Foo"};
+    const node = try parser.parseTopLevel();
+    const raw = node.element.children[0].raw_code;
+    try std.testing.expectEqual(@as(usize, 1), raw.segments.len);
+    try std.testing.expectEqualStrings(" fmt.Println(\"100% done <Foo>\") ", raw.segments[0].code);
+}
+
+test "<%...%> a % or < sitting inside a real Go comment doesn't confuse the scan" {
+    const src = "<Container><% // 100% done <Foo>\nreal() %></Container>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    parser.known_tags = &.{"Foo"};
+    const node = try parser.parseTopLevel();
+    const raw = node.element.children[0].raw_code;
+    try std.testing.expectEqual(@as(usize, 1), raw.segments.len);
+    try std.testing.expect(std.mem.indexOf(u8, raw.segments[0].code, "real()") != null);
+}
+
+test "nested '<%' before the matching '%>' is a clear parse error" {
+    const src = "<Container><% a() <% b() %> %></Container>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    try std.testing.expectError(error.ParseError, parser.parseTopLevel());
+    try std.testing.expect(std.mem.indexOf(u8, parser.last_error.?.message, "nested") != null);
+}
+
+test "an unterminated '<%' (missing '%>') is a clear parse error, not a hang" {
+    const src = "<Container><% a := 1</Container>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    try std.testing.expectError(error.ParseError, parser.parseTopLevel());
+    try std.testing.expect(std.mem.indexOf(u8, parser.last_error.?.message, "unterminated") != null);
+}
+
+test "multiple known tags splice in as separate segments, each with real content around them" {
+    const src = "<Container><%<A/>text<B/>%></Container>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    parser.known_tags = &.{ "A", "B" };
+    const node = try parser.parseTopLevel();
+    const raw = node.element.children[0].raw_code;
+    try std.testing.expectEqual(@as(usize, 3), raw.segments.len);
+    try std.testing.expectEqualStrings("A", raw.segments[0].tag.tag);
+    try std.testing.expectEqualStrings("text", raw.segments[1].code);
+    try std.testing.expectEqualStrings("B", raw.segments[2].tag.tag);
 }
