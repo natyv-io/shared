@@ -815,17 +815,23 @@ const Emitter = struct {
     /// A `styles={...}` attribute's real effect on this element's own
     /// `LayoutDefaults` -- generalizes what used to be `marginFor`'s
     /// single-purpose lookup to the rest of Clay's real layout vocabulary
-    /// (`direction`/`childGap`/`width`/`height`/`alignX`/`alignY`), all of
-    /// which share the exact same "look up each named token, later-wins"
-    /// resolution `margin` already established. See `Resolver.
-    /// ResolvedStyleToken`'s own doc comment for why these fields are
-    /// resolved here, at `.ntx`-transpile time, rather than through the
-    /// runtime `ApplyStyle` mechanism the way background/border/gradient
-    /// are.
+    /// (`direction`/`childGap`/`padding`/`width`/`height`/`alignX`/
+    /// `alignY`), all of which share the exact same "look up each named
+    /// token, later-wins" resolution `margin` already established.
+    /// `padding` (2026-09-02): `Resolver.zig` already parsed a token's own
+    /// `padding:` property from day one, but this file never actually read
+    /// it back off `ResolvedStyleToken` -- every `.ntx` Container/Panel was
+    /// stuck with its hardcoded default 8px padding on every side no
+    /// matter what `styles=` named, a real, disclosed gap until now. See
+    /// `Resolver.ResolvedStyleToken`'s own doc comment for why these
+    /// fields are resolved here, at `.ntx`-transpile time, rather than
+    /// through the runtime `ApplyStyle` mechanism the way background/
+    /// border/gradient are.
     const LayoutStyleOverride = struct {
         margin: ?u16 = null,
         direction: ?Resolver.Direction = null,
         child_gap: ?u16 = null,
+        padding: ?u16 = null,
         width: ?Resolver.Sizing = null,
         height: ?Resolver.Sizing = null,
         align_x: ?Resolver.AlignX = null,
@@ -846,6 +852,7 @@ const Emitter = struct {
                         if (tok.margin) |m| out.margin = m;
                         if (tok.direction) |d| out.direction = d;
                         if (tok.child_gap) |g| out.child_gap = g;
+                        if (tok.padding) |p| out.padding = p;
                         if (tok.width) |w| out.width = w;
                         if (tok.height) |h| out.height = h;
                         if (tok.align_x) |ax| out.align_x = ax;
@@ -889,6 +896,7 @@ const Emitter = struct {
         var out = base;
         if (style.direction) |d| out.direction = directionExpr(d);
         if (style.child_gap) |g| out.child_gap = g;
+        if (style.padding) |p| out.padding = p;
         if (style.width) |w| out.width = w;
         if (style.height) |h| out.height = h;
         if (style.align_x) |ax| out.align_x = alignXExpr(ax);
@@ -2628,6 +2636,27 @@ test "styles naming a token overrides direction, childGap, width, and alignment 
     // The Container tag's own hardcoded Padding default (8) survives
     // untouched -- the style token above never set `padding`.
     try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.Padding = widgets.Padding{Left: 8, Right: 8, Top: 8, Bottom: 8}") != null);
+}
+
+test "styles naming a token overrides a Container's own hardcoded padding" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Container styles={tight}>
+        \\    <Label>hi</Label>
+        \\  </Container>
+        \\}
+    ;
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "tight", .padding = 0 }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.Padding = widgets.Padding{Left: 0, Right: 0, Top: 0, Bottom: 0}") != null);
 }
 
 test "styles naming a token overrides a leaf widget's own hardcoded fixed size" {
