@@ -1269,21 +1269,49 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attrs = &.{"placeholder"};
         } else if (std.mem.eql(u8, el.tag, "TextArea")) {
-            // Real, initial-content role (like Label/Button's own `text`),
-            // not a separate placeholder-vs-content distinction the way
-            // TextField's own `placeholder=` has -- matches how every real
-            // hand-written `widgets.CreateTextArea(...)` call in this
-            // codebase already uses its second argument (either the real
-            // body text directly, or a literal placeholder string, never
-            // both at once).
+            // `CreateTextArea`'s own 2nd argument is a *placeholder-only*
+            // buffer (natyv-core's TextArea.zig: a fixed 63-byte
+            // `placeholder_buf`, silently truncated, rendered in a
+            // dedicated dimmed style only while the field is otherwise
+            // empty) -- NOT a general "initial content" channel, despite
+            // an earlier, wrong assumption recorded here. A `text={expr}`
+            // attribute means real, potentially-long dynamic content, so
+            // it must go through `.SetText(...)` *after* creation instead
+            // -- confirmed the hard way via a real, garbled/truncated
+            // live TextArea (Quinn's own click-through, 2026-09-02).
+            // Literal child text (no `text=` attribute) keeps the
+            // original placeholder-constructor-arg behavior unchanged --
+            // that's real placeholder/hint-text usage (e.g. a compose
+            // body field's "Body" hint), genuinely short by design.
+            const text_child = try self.childText(el);
+            const text_attr = try self.textAttr(el);
+            if (text_attr != null and text_child != null) {
+                return self.fail(el.line, el.col, "<TextArea> can't have both a 'text' attribute and literal child text -- pick one", .{});
+            }
             try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(320), .height = fixedSizing(200) }, layout_style));
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateTextArea(");
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ", ");
-            try self.emitWidgetText(el);
-            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            if (text_attr) |ta| {
+                try self.out.appendSlice(self.allocator, "\"\")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+                try self.out.appendSlice(self.allocator, "\tif err := ");
+                try self.out.appendSlice(self.allocator, var_name);
+                try self.out.appendSlice(self.allocator, ".SetText(");
+                try self.emitNamedTextAttrValue(ta);
+                try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
+            } else {
+                const text = if (text_child) |t| t.text else "";
+                const gen_start = self.out.items.len;
+                try writeGoStringLiteral(self.out, self.allocator, text);
+                const gen_end = self.out.items.len;
+                if (text_child) |t| {
+                    const abs = translatePosition(self.body_line, self.body_col, t.line, t.col);
+                    try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(t.text.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .child_text });
+                }
+                try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            }
             skip_attrs = &.{"text"};
         } else if (std.mem.eql(u8, el.tag, "Checkbox")) {
             try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(24) }, layout_style));
@@ -3339,7 +3367,8 @@ test "<TextArea> uses text={expr} for real, dynamic initial content" {
     const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
-    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateTextArea(TextArea0Layout, decodeMimeBody(body))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateTextArea(TextArea0Layout, \"\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "TextArea0.SetText(decodeMimeBody(body))") != null);
 }
 
 test "<TextArea>literal placeholder</TextArea> still works as plain child text" {
