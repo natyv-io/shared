@@ -396,7 +396,7 @@ const Emitter = struct {
     }
 
     fn consumesTextChildren(tag: []const u8) bool {
-        for ([_][]const u8{ "Label", "Button", "TextArea", "Checkbox", "RadioButton", "Toggle", "Badge", "Dropdown", "Menu", "Popover" }) |t| {
+        for ([_][]const u8{ "Label", "Button", "TextArea", "Checkbox", "RadioButton", "Toggle", "Badge", "Dropdown", "Menu", "Popover", "Tooltip", "DateTimePicker" }) |t| {
             if (std.mem.eql(u8, tag, t)) return true;
         }
         return false;
@@ -989,7 +989,7 @@ const Emitter = struct {
         "Badge",     "Spinner",         "Panel",           "Combobox",  "Dropdown",
         "Breadcrumbs", "Menu",          "MenuBar",         "Table",     "Tree",
         "Window",    "Dialog",          "ToastStack",      "Tabs",      "TabPanel",
-        "AccordionSection", "Card",     "Popover",
+        "AccordionSection", "Card",     "Popover",         "Tooltip",   "DateTimePicker",
     };
 
     fn isBuiltinWidgetKind(tag: []const u8) bool {
@@ -1022,10 +1022,15 @@ const Emitter = struct {
     /// `uint32(<var>)` already works for them like any Stage 1 simple
     /// widget. TabPanel isn't a distinct Go type at all -- `CreateTabPanel`
     /// returns a plain `Container`, uint32-based like any other.
+    ///
+    /// Tooltip/DateTimePicker (2026-09-02) are real SDK widgets that
+    /// predate Stage 1/2's own 27-widget count (added in an earlier,
+    /// separate session) and were never wired into `.ntx` at all until
+    /// now -- both `*Struct`, like Dropdown.
     const struct_backed_widget_kinds = [_][]const u8{
         "Combobox", "Dropdown",   "Breadcrumbs",      "Menu", "MenuBar",
         "Table",    "Tree",       "Dialog",           "ToastStack",
-        "AccordionSection", "Card", "Popover",
+        "AccordionSection", "Card", "Popover",        "Tooltip", "DateTimePicker",
     };
 
     fn isStructBackedWidgetKind(tag: []const u8) bool {
@@ -1048,6 +1053,7 @@ const Emitter = struct {
     const pointer_returning_widget_kinds = [_][]const u8{
         "Combobox",   "Dropdown", "Menu",  "MenuBar", "Table", "Tree",
         "ToastStack", "AccordionSection", "Card", "Popover",
+        "Tooltip",    "DateTimePicker",
     };
 
     fn isPointerReturningWidgetKind(tag: []const u8) bool {
@@ -1888,6 +1894,62 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attrs = &.{"title"};
             children_parent_expr = try std.fmt.allocPrint(self.allocator, "{s}.ContentID()", .{var_name});
+        } else if (std.mem.eql(u8, el.tag, "Tooltip")) {
+            // Real SDK widget that predates Stage 1/2's own 27-widget count
+            // (added in an earlier, separate session) -- never wired into
+            // `.ntx` until now. Self-closing (the panel/label are built
+            // entirely internally on hover, see tooltip.go) -- trigger
+            // label is child text/`text=`, same convention Menu/Dropdown's
+            // own trigger already uses.
+            const width = try self.requiredExprAttr(el, "width");
+            const height = try self.requiredExprAttr(el, "height");
+            const message = try self.requiredNamedTextAttr(el, "message");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateTooltip(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitWidgetText(el);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(width);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(height);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitNamedTextAttrValue(message);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "text", "width", "height", "message" };
+        } else if (std.mem.eql(u8, el.tag, "DateTimePicker")) {
+            // Also predates Stage 1/2's own count, also never wired in
+            // until now. Self-closing (the calendar panel is built
+            // entirely internally on click, see datetimepicker.go) --
+            // trigger label is child text/`text=`, same convention as
+            // Tooltip/Menu/Dropdown above. `onSelect={...}` binds
+            // generically to `.OnSelect(...)` via the existing `on[A-Z]`
+            // convention -- no special-casing needed despite its unusual
+            // 5-argument handler signature, same as Table.OnSelect already
+            // proved for Stage 1.
+            const year = try self.requiredExprAttr(el, "year");
+            const month = try self.requiredExprAttr(el, "month");
+            const hour = try self.requiredExprAttr(el, "hour");
+            const minute = try self.requiredExprAttr(el, "minute");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(32) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateDateTimePicker(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitWidgetText(el);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(year);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(month);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(hour);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitExprAttrValue(minute);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attrs = &.{ "text", "year", "month", "hour", "minute" };
         } else if (std.mem.eql(u8, el.tag, "Popover")) {
             // `build func(panelID uint32) ([]uint32, error)` needs every
             // created child's id collected and returned -- a genuinely
@@ -4180,4 +4242,58 @@ test "<Popover ref={&x}/> assigns the already-pointer var directly, no extra &" 
     try std.testing.expect(r.err == null);
     try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myPopover = Popover0") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myPopover = &Popover0") == null);
+}
+
+test "<Tooltip>Hover me</Tooltip> uses child text as the trigger label, forwards width/height/message" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Tooltip width={200} height={60} message=\"Details here\">Hover me</Tooltip>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateTooltip(Tooltip0Layout, \"Hover me\", 200, 60, \"Details here\")") != null);
+}
+
+test "<Tooltip ref={&x}/> assigns the already-pointer var directly, no extra &" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Tooltip ref={&myTooltip} width={200} height={60} message=\"Hi\">Hover</Tooltip>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myTooltip = Tooltip0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myTooltip = &Tooltip0") == null);
+}
+
+test "<Tooltip styles={...}/> targets .ID()" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const src = "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Tooltip styles={nav} width={200} height={60} message=\"Hi\">Hover</Tooltip>\n}\n";
+    const found = try Expose.findComposers(allocator, src);
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "nav", .background_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } }};
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyle(Tooltip0.ID(), StyleTokens, \"nav\")") != null);
+}
+
+test "<DateTimePicker>Pick a date</DateTimePicker> uses child text as the trigger label, forwards year/month/hour/minute" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <DateTimePicker year={2026} month={9} hour={14} minute={30}>Pick a date</DateTimePicker>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateDateTimePicker(DateTimePicker0Layout, \"Pick a date\", 2026, 9, 14, 30)") != null);
+}
+
+test "<DateTimePicker onSelect={...}/> binds generically via the on[A-Z] convention" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <DateTimePicker onSelect={handlePicked} year={2026} month={9} hour={14} minute={30}>Pick</DateTimePicker>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "DateTimePicker0.OnSelect(handlePicked)") != null);
+}
+
+test "<DateTimePicker ref={&x}/> assigns the already-pointer var directly, no extra &" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <DateTimePicker ref={&myPicker} year={2026} month={9} hour={14} minute={30}>Pick</DateTimePicker>\n}\n");
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myPicker = DateTimePicker0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myPicker = &DateTimePicker0") == null);
 }
