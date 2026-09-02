@@ -396,7 +396,7 @@ const Emitter = struct {
     }
 
     fn consumesTextChildren(tag: []const u8) bool {
-        return std.mem.eql(u8, tag, "Label") or std.mem.eql(u8, tag, "Button");
+        return std.mem.eql(u8, tag, "Label") or std.mem.eql(u8, tag, "Button") or std.mem.eql(u8, tag, "TextArea");
     }
 
     /// Looks up a plain (non-braced) string attribute by name -- e.g.
@@ -832,7 +832,7 @@ const Emitter = struct {
     /// in sync by hand -- avoids exactly the kind of drift this project
     /// already added a dedicated regression test for once before
     /// (`BindingsHostFnUtil.zig`).
-    pub const builtin_widget_kinds = [_][]const u8{ "Container", "Label", "Button", "TextField", "Image" };
+    pub const builtin_widget_kinds = [_][]const u8{ "Container", "Label", "Button", "TextField", "TextArea", "Image" };
 
     fn isBuiltinWidgetKind(tag: []const u8) bool {
         for (builtin_widget_kinds) |kind| {
@@ -1163,6 +1163,23 @@ const Emitter = struct {
             }
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attr = "placeholder";
+        } else if (std.mem.eql(u8, el.tag, "TextArea")) {
+            // Real, initial-content role (like Label/Button's own `text`),
+            // not a separate placeholder-vs-content distinction the way
+            // TextField's own `placeholder=` has -- matches how every real
+            // hand-written `widgets.CreateTextArea(...)` call in this
+            // codebase already uses its second argument (either the real
+            // body text directly, or a literal placeholder string, never
+            // both at once).
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(320), .height = fixedSizing(200) }, layout_style));
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateTextArea(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitWidgetText(el);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attr = "text";
         } else if (std.mem.eql(u8, el.tag, "Image")) {
             // `background: true` (not false) is required -- Container's
             // own fillRect() dispatch returns null entirely when
@@ -2932,3 +2949,39 @@ test "<%...%> an unregistered tag-shaped name inside raw code round-trips as pla
     try std.testing.expect(std.mem.indexOf(u8, gen, "ok := a < NotARealTag(b)") != null);
 }
 
+
+test "<TextArea> uses text={expr} for real, dynamic initial content" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <TextArea text={decodeMimeBody(body)} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateTextArea(TextArea0Layout, decodeMimeBody(body))") != null);
+}
+
+test "<TextArea>literal placeholder</TextArea> still works as plain child text" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <TextArea>Body</TextArea>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateTextArea(TextArea0Layout, \"Body\")") != null);
+}
