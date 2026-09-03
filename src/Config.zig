@@ -228,6 +228,21 @@ sqlite: SqliteConfig = .{},
 network: NetworkConfig = .{},
 images: ImagesConfig = .{},
 ui: UiConfig = .{},
+/// Where the guest's own `pdk.Log(...)` calls (via Extism's built-in
+/// `extism:host/env log_*` imports -- no natyv-core host function needed,
+/// every plugin gets these for free) actually go. `null` (the default)
+/// means logging is fully disabled -- natyv-core never calls
+/// `extism_log_custom` at all, so a guest's log calls are silently
+/// dropped by Extism itself rather than natyv-core doing any filtering of
+/// its own. `"stdout"`/`"stderr"` write to the process's own standard
+/// streams; any other value is treated as a filename, resolved via
+/// `SDL_GetPrefPath` the same way `sqlite.filename` already is (real,
+/// per-app, per-OS-conventional storage, not a bare cwd-relative path).
+/// Which level a given call logs at is a guest-code decision (see
+/// `sdk/go`'s own `Info`/`Warn`/etc. wrappers), not something this field
+/// controls -- natyv-core always subscribes to every level and lets the
+/// drain handler decide what (if anything) to do with each line.
+logging: ?[]const u8 = null,
 /// Libraries `natyv bind` generates C bindings for -- see `BindingEntry`'s
 /// own doc comment. Empty (the default) means no bindings for this app.
 bindings: []const BindingEntry = &.{},
@@ -348,6 +363,25 @@ test "wasmFilename derives <name>.wasm" {
     const filename = try parsed.value.wasmFilename(allocator);
     defer allocator.free(filename);
     try std.testing.expectEqualStrings("bookstore.wasm", filename);
+}
+
+test "logging: defaults to null (disabled), stdout/stderr/a filename all round-trip" {
+    const allocator = std.testing.allocator;
+    const defaults = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer defaults.deinit();
+    try std.testing.expect(defaults.value.logging == null);
+
+    const stdout = try parseBytes(allocator,
+        \\{"wasm_compile":"tinygo build -o app.wasm .","logging":"stdout"}
+    );
+    defer stdout.deinit();
+    try std.testing.expectEqualStrings("stdout", stdout.value.logging.?);
+
+    const file = try parseBytes(allocator,
+        \\{"wasm_compile":"tinygo build -o app.wasm .","logging":"app.log"}
+    );
+    defer file.deinit();
+    try std.testing.expectEqualStrings("app.log", file.value.logging.?);
 }
 
 test "bundle_id/icon: default to null, a real value round-trips" {
