@@ -57,6 +57,47 @@ pub const TlsMode = enum {
     starttls,
 };
 
+/// How `natyv build` compiles natyv-core itself for this app -- maps
+/// one-to-one onto Zig's own real `std.builtin.OptimizeMode` choices,
+/// just spelled out in natyv's own conf.natyv.json vocabulary rather than
+/// Zig's, matching `TlsMode` above's own precedent of a plain enum parsed
+/// directly from a JSON string. `.debug` (the field's own default, see
+/// `build_mode` below) preserves `natyv build`'s original behavior
+/// exactly -- full debug symbols, no optimization, by far the largest and
+/// slowest-running binary, but the fastest to iterate on. **Real,
+/// measured difference, confirmed via a live A/B rebuild of the
+/// mail-natyv benchmark app (2026-09-03)**: `.release_small` cut that
+/// same app's real bundled size from 84MB to 27MB (a real ~3x reduction,
+/// not a rough estimate) and *lowered* idle RSS too (roughly 54-56MB vs
+/// 70-100MB) -- any app meant for real distribution should set this to a
+/// release mode, not ship on the default. `.release_small`/
+/// `.release_fast`/`.release_safe` are Zig's own real remaining three
+/// modes, offered as distinct choices (not collapsed into one generic
+/// "release") since size-vs-speed is a real, per-app tradeoff natyv
+/// shouldn't silently pick for a dev -- natyv's own positioning leans
+/// toward `.release_small` (see core's CLAUDE.md "leaner than Electron on
+/// memory"), but `.release_fast` is the more conventional default for a
+/// CPU-bound app that would rather trade disk size for raw speed.
+pub const BuildMode = enum {
+    debug,
+    release_fast,
+    release_small,
+    release_safe,
+
+    /// The real `-Doptimize=<...>` flag `Bundle.zig` passes straight
+    /// through to `zig build` -- kept here, next to the enum it derives
+    /// from, rather than as a lookup table living in `cli` -- so this
+    /// mapping only ever has one real home to go stale in.
+    pub fn optimizeFlag(self: BuildMode) []const u8 {
+        return switch (self) {
+            .debug => "-Doptimize=Debug",
+            .release_fast => "-Doptimize=ReleaseFast",
+            .release_small => "-Doptimize=ReleaseSmall",
+            .release_safe => "-Doptimize=ReleaseSafe",
+        };
+    }
+};
+
 /// One endpoint a guest may open a raw TCP socket to -- see
 /// `natyv-tcp-tls-host-function` memory for the full design. Real
 /// enforcement happens at `tcp_connect` time: any host:port the guest
@@ -288,6 +329,13 @@ compile_targets: []const []const u8 = &.{},
 /// local iteration usually doesn't want on every single build.
 linux_package: ?[]const u8 = null,
 
+/// How `natyv build` compiles natyv-core itself for this app -- see
+/// `BuildMode`'s own doc comment above for the real, measured reason this
+/// exists. `.debug` is the default, preserving `natyv build`'s original
+/// behavior exactly (unset `-Doptimize` means Zig's own implicit Debug
+/// default).
+build_mode: BuildMode = .debug,
+
 /// The compiled guest module's real on-disk filename, derived from
 /// `name` -- `natyv prepare`/`natyv build` always compile to `<name>.wasm`
 /// (a real, already-consistent convention across every existing example
@@ -382,6 +430,28 @@ test "logging: defaults to null (disabled), stdout/stderr/a filename all round-t
     );
     defer file.deinit();
     try std.testing.expectEqualStrings("app.log", file.value.logging.?);
+}
+
+test "build_mode: defaults to .debug, each real Zig optimize mode round-trips with the right flag" {
+    const allocator = std.testing.allocator;
+    const defaults = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer defaults.deinit();
+    try std.testing.expectEqual(BuildMode.debug, defaults.value.build_mode);
+    try std.testing.expectEqualStrings("-Doptimize=Debug", defaults.value.build_mode.optimizeFlag());
+
+    const cases = [_]struct { json: []const u8, mode: BuildMode, flag: []const u8 }{
+        .{ .json = "release_fast", .mode = .release_fast, .flag = "-Doptimize=ReleaseFast" },
+        .{ .json = "release_small", .mode = .release_small, .flag = "-Doptimize=ReleaseSmall" },
+        .{ .json = "release_safe", .mode = .release_safe, .flag = "-Doptimize=ReleaseSafe" },
+    };
+    for (cases) |case| {
+        const buf = try std.fmt.allocPrint(allocator, "{{\"wasm_compile\":\"tinygo build -o app.wasm .\",\"build_mode\":\"{s}\"}}", .{case.json});
+        defer allocator.free(buf);
+        const parsed = try parseBytes(allocator, buf);
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.mode, parsed.value.build_mode);
+        try std.testing.expectEqualStrings(case.flag, parsed.value.build_mode.optimizeFlag());
+    }
 }
 
 test "bundle_id/icon: default to null, a real value round-trips" {
