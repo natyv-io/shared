@@ -145,6 +145,28 @@ pub const ImagesConfig = struct {
     enabled: bool = false,
 };
 
+/// Controls the memory-reclamation recycle mechanism's real trigger --
+/// see `project_natyv_instance_recycling_idea` memory for the full design.
+/// `null` (the default) disables automatic RSS-based recycling entirely,
+/// same fail-safe-off posture as every other capability here -- a dev has
+/// to explicitly opt in, since a recycle force-closes every open TCP
+/// connection and isn't free (a real, measured ~30ms). This is also a
+/// second, independent gate on top of `can_recycle` (the app implementing
+/// both `natyv_checkpoint`/`natyv_resume`) -- an app that implements those
+/// exports for some other reason doesn't get automatic recycling just for
+/// that; it has to also set a threshold here.
+pub const MemoryConfig = struct {
+    /// Real process RSS, in MB -- once a post-dispatch check sees the
+    /// process at or above this, the host recycles the guest instance
+    /// before the next dispatch. Compared against whole-process RSS (the
+    /// same number `ps`/Activity Monitor report, and the same measurement
+    /// this project's own recycle benchmarking already uses), not an
+    /// estimate of the guest's own linear memory alone -- Extism/Wasmtime
+    /// doesn't expose that as a separate, cheaper number, and whole-process
+    /// RSS is what a dev actually cares about bounding regardless.
+    recycle_threshold_mb: ?u32 = null,
+};
+
 /// One C library `natyv bind` should generate Extism host-function
 /// trampolines + guest-wrapper code for -- Stage 2.1 of
 /// ~/.claude/plans/lexical-wishing-penguin.md. Written/updated by `natyv
@@ -268,6 +290,7 @@ wasm_compile: []const u8,
 sqlite: SqliteConfig = .{},
 network: NetworkConfig = .{},
 images: ImagesConfig = .{},
+memory: MemoryConfig = .{},
 ui: UiConfig = .{},
 /// Where the guest's own `pdk.Log(...)` calls (via Extism's built-in
 /// `extism:host/env log_*` imports -- no natyv-core host function needed,
@@ -605,4 +628,17 @@ test "compile_targets/linux_package: default to empty/null, an explicit value ro
     try std.testing.expectEqualStrings("macos-arm64", with_both.value.compile_targets[0]);
     try std.testing.expectEqualStrings("linux-arm64", with_both.value.compile_targets[1]);
     try std.testing.expectEqualStrings("appimage", with_both.value.linux_package.?);
+}
+
+test "memory.recycle_threshold_mb: defaults to null (recycling disabled), an explicit value round-trips" {
+    const allocator = std.testing.allocator;
+    const defaults = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(?u32, null), defaults.value.memory.recycle_threshold_mb);
+
+    const with_threshold = try parseBytes(allocator,
+        \\{"wasm_compile":"tinygo build -o app.wasm .","memory":{"recycle_threshold_mb":200}}
+    );
+    defer with_threshold.deinit();
+    try std.testing.expectEqual(@as(?u32, 200), with_threshold.value.memory.recycle_threshold_mb);
 }
