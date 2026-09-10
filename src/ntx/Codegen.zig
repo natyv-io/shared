@@ -402,6 +402,18 @@ fn isSafeToResplice(expr: []const u8, composer_params: []const []const u8, compo
     return true;
 }
 
+/// Part 2 (codegen automation), Mechanism 1: true when `target` (a single
+/// identifier, e.g. a `ref={&target}` name -- never a compound expression)
+/// matches one of `composer_raw_code_locals`. A plain membership check,
+/// not `isSafeToResplice` (which tokenizes an arbitrary *expression*) --
+/// `target` already is one identifier.
+fn isRawCodeLocal(target: []const u8, composer_raw_code_locals: []const []const u8) bool {
+    for (composer_raw_code_locals) |l| {
+        if (std.mem.eql(u8, target, l)) return true;
+    }
+    return false;
+}
+
 /// True when `code[pos..]` starts with `keyword` as a real, standalone
 /// token -- not part of a larger identifier on either side (e.g. `variable`
 /// must not match `var`).
@@ -2596,7 +2608,30 @@ const Emitter = struct {
                     // in `ref={&nameField}`), not `ref`'s own position --
                     // the position a real hover/go-to-definition request
                     // against that identifier actually needs.
-                    .ref => |r| try self.emitRefAssign(r.target, var_name, isPointerReturningWidgetKind(el.tag), r.line, r.col),
+                    .ref => |r| {
+                        try self.emitRefAssign(r.target, var_name, isPointerReturningWidgetKind(el.tag), r.line, r.col);
+                        // Part 2 (codegen automation), Mechanism 1: every
+                        // ref='d non-struct-backed target unconditionally
+                        // qualifies for auto-persistence -- the asymmetric-
+                        // risk argument (over-persisting a transient ref
+                        // costs a few bytes; under-persisting one that was
+                        // needed nil-panics on resume) holds cleanly for
+                        // this set, since every one of these is a named
+                        // `uint32` type with no struct-field-visibility
+                        // problem. Excludes a raw-code-block local (e.g.
+                        // MessageRow's own `checkbox`) via the same
+                        // classifier composer_raw_code_locals already
+                        // backs -- it has no stable package-level name to
+                        // key persisted storage under, and is transient by
+                        // construction anyway. Struct-backed kinds are
+                        // deliberately untouched here -- their
+                        // ref-persistence is entirely subsumed by the
+                        // tier-2/3 accessor mechanism instead (a later
+                        // stage of this same pass), never this one.
+                        if (self.recycle_enabled and !isStructBackedWidgetKind(el.tag) and !isRawCodeLocal(r.target, self.composer_raw_code_locals)) {
+                            try self.ref_persist_entries.append(self.allocator, .{ .widget_kind = el.tag, .target_name = r.target });
+                        }
+                    },
                     else => return self.fail(attr.line, attr.col, "malformed 'ref' attribute", .{}),
                 }
             } else if (isEventAttr(attr.name)) {
@@ -3001,7 +3036,15 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
         m.gen_end += header_len;
     }
 
-    return .{ .output = .{ .generated = try generated.toOwnedSlice(allocator), .logic = logic, .source_map = try mappings.toOwnedSlice(allocator), .semantic_tokens = try semantic_tokens.toOwnedSlice(allocator), .edits = try edits.toOwnedSlice(allocator) }, .err = null };
+    return .{ .output = .{
+        .generated = try generated.toOwnedSlice(allocator),
+        .logic = logic,
+        .source_map = try mappings.toOwnedSlice(allocator),
+        .semantic_tokens = try semantic_tokens.toOwnedSlice(allocator),
+        .edits = try edits.toOwnedSlice(allocator),
+        .ref_persist_entries = try ref_persist_entries.toOwnedSlice(allocator),
+        .struct_backed_snapshot_entries = try struct_backed_snapshot_entries.toOwnedSlice(allocator),
+    }, .err = null };
 }
 
 test "recycle_enabled: a bare-function onClick auto-generates RegisterBinding, a rebind function, and init()" {
@@ -3262,6 +3305,111 @@ test "bindArgs= still works when its expression references a raw-code block's su
 
     try std.testing.expect(std.mem.indexOf(u8, gen, "natyv.RegisterBinding(uint32(Checkbox1), \"rowCheckbox\", rowArgs{Seq: seq})") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
+}
+
+test "Mechanism 1: a non-struct-backed ref= unconditionally qualifies for ref-persistence when recycle_enabled" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <Container ref={&contentArea}>
+        \\    <TextField ref={&toField} />
+        \\  </Container>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const entries = result.output.?.ref_persist_entries;
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("Container", entries[0].widget_kind);
+    try std.testing.expectEqualStrings("contentArea", entries[0].target_name);
+    try std.testing.expectEqualStrings("TextField", entries[1].widget_kind);
+    try std.testing.expectEqualStrings("toField", entries[1].target_name);
+}
+
+test "Mechanism 1: recycle_enabled=false collects no ref-persistence entries at all" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <TextField ref={&toField} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
+    try std.testing.expect(result.err == null);
+    try std.testing.expectEqual(@as(usize, 0), result.output.?.ref_persist_entries.len);
+}
+
+test "Mechanism 1: a struct-backed ref= is excluded from ref-persistence (subsumed by the tier-2/3 mechanism instead)" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <Dropdown ref={&pageSizeDropdown} options={opts} onSelect={onPageSize} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    try std.testing.expectEqual(@as(usize, 0), result.output.?.ref_persist_entries.len);
+}
+
+test "Mechanism 1: a raw-code-block-local ref= is excluded from ref-persistence" {
+    // Real shape from mail-natyv's own MessageRow -- rowWidget's ref is a
+    // plain package-level slot (qualifies), but checkbox is declared
+    // inside the same <%...%> block it's ref'd from (excluded: no stable
+    // package-level name to key persisted storage under, transient by
+    // construction).
+    const src =
+        \\package main
+        \\
+        \\expose MessageRow
+        \\
+        \\func MessageRow(parent uint32) error {
+        \\  <Container ref={&rowWidget}>
+        \\    <%
+        \\      var checkbox *widgets.Checkbox
+        \\      <Checkbox ref={&checkbox} />
+        \\    %>
+        \\  </Container>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const entries = result.output.?.ref_persist_entries;
+
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("rowWidget", entries[0].target_name);
 }
 
 test "generates a builder function and a spliced logic file for a single flat composer" {
