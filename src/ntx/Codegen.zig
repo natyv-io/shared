@@ -633,6 +633,70 @@ const Emitter = struct {
         try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
     }
 
+    /// Atomic counterpart to `emitApplyStyle`: resolves `names` into
+    /// `layout_var`'s own style fields via `widgets.ApplyStyleToLayout`
+    /// *before* the matching `CreateX(layout_var, ...)` call consumes it,
+    /// instead of a separate call against an already-created widget's id
+    /// afterward. Closes a real race `ApplyStyleToLayout`'s own SDK doc
+    /// comment describes: a widget created via `CreateX` then styled via a
+    /// *separate*, later, independently-locked host call exists with no
+    /// visual style at all for a real window an unrelated main-thread
+    /// redraw can land in and render that way -- confirmed live 2026-09-09
+    /// against mail-natyv, root-caused fully 2026-09-10 (see
+    /// project_natyv_render_loop_fix memory: this exact mechanism was
+    /// built and available since 2026-09-09 but never actually wired into
+    /// this file until now, so no real `.ntx`-authored app had ever
+    /// actually exercised it). Called from `emitLayout` itself (not a
+    /// per-tag call site) so it's structurally impossible for a future
+    /// widget-kind branch to forget it -- see that function's own doc
+    /// comment. No `isStructBackedWidgetKind`/`.ID()` distinction is
+    /// needed here at all (unlike `emitApplyStyle`) -- this operates on
+    /// the plain local `Layout` value every widget kind builds one of,
+    /// before any widget-kind-specific `Create*` shape exists yet.
+    fn emitApplyStyleToLayout(self: *Emitter, layout_var: []const u8, names: []const Parser.StyleRef) EmitError!void {
+        try self.out.appendSlice(self.allocator, "\tif err := widgets.ApplyStyleToLayout(&");
+        try self.out.appendSlice(self.allocator, layout_var);
+        try self.out.appendSlice(self.allocator, ", StyleTokens");
+        for (names) |n| {
+            try self.out.appendSlice(self.allocator, ", ");
+            const abs = translatePosition(self.body_line, self.body_col, n.line, n.col);
+            const gen_start = self.out.items.len;
+            try writeGoStringLiteral(self.out, self.allocator, n.name);
+            const gen_end = self.out.items.len;
+            try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(n.name.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .style_token });
+            try self.semantic_tokens.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(n.name.len), .token_type = .string });
+        }
+        try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
+    }
+
+    /// Atomic counterpart to `emitApplyStyleWithTexture`, mirroring
+    /// `emitApplyStyleToLayout`'s own pre-creation placement -- see both of
+    /// those doc comments. Used only by the `<Image>` branch, which calls
+    /// this directly (not through `emitLayout`, since only `<Image>` ever
+    /// needs the texture-override shape) right after its own `emitLayout`
+    /// call, in place of the generic atomic call `emitLayout` would
+    /// otherwise have emitted (that branch passes `emitLayout` an empty
+    /// names slice specifically so it doesn't also emit a redundant plain
+    /// `ApplyStyleToLayout`).
+    fn emitApplyStyleToLayoutWithTexture(self: *Emitter, layout_var: []const u8, names: []const Parser.StyleRef, texture_id: u32) EmitError!void {
+        try self.out.appendSlice(self.allocator, "\tif err := widgets.ApplyStyleToLayoutWithTexture(&");
+        try self.out.appendSlice(self.allocator, layout_var);
+        try self.out.appendSlice(self.allocator, ", StyleTokens, ");
+        var buf: [10]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&buf, "{d}", .{texture_id}) catch unreachable;
+        try self.out.appendSlice(self.allocator, id_str);
+        for (names) |n| {
+            try self.out.appendSlice(self.allocator, ", ");
+            const abs = translatePosition(self.body_line, self.body_col, n.line, n.col);
+            const gen_start = self.out.items.len;
+            try writeGoStringLiteral(self.out, self.allocator, n.name);
+            const gen_end = self.out.items.len;
+            try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(n.name.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .style_token });
+            try self.semantic_tokens.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(n.name.len), .token_type = .string });
+        }
+        try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
+    }
+
     /// `ref={&target}` -- `target` (already stripped of its leading `&` by
     /// `Parser`) is a plain identifier naming a package-level `*WidgetType`
     /// variable declared by hand elsewhere in the logic file, untouched by
@@ -778,8 +842,19 @@ const Emitter = struct {
     /// plus one assignment statement per non-null `LayoutDefaults` field --
     /// building on the SDK's own real `ParentID` convenience constructor
     /// (see `layout.go`) rather than hand-rolling the pointer-taking
-    /// ourselves.
-    fn emitLayout(self: *Emitter, layout_var: []const u8, parent_expr: []const u8, d: LayoutDefaults) EmitError!void {
+    /// ourselves. Finally, when `style_names` is non-empty, emits a real
+    /// `widgets.ApplyStyleToLayout(&layout_var, StyleTokens, ...)` call
+    /// against this same freshly-built `layout_var` -- see
+    /// `emitApplyStyleToLayout`'s own doc comment for why this belongs
+    /// here (the one place every widget-creating branch already builds a
+    /// `Layout` value) rather than at each of this function's ~30 call
+    /// sites individually. Pass `&.{}` for `style_names` at a call site
+    /// that must never receive the real element's own style (the margin
+    /// wrapper in `emitMarginWrapper`, and `<Image>`'s own `emitLayout`
+    /// call, which instead gets styled via a direct, separate
+    /// `emitApplyStyleToLayoutWithTexture` call right after this one
+    /// returns).
+    fn emitLayout(self: *Emitter, layout_var: []const u8, parent_expr: []const u8, d: LayoutDefaults, style_names: []const Parser.StyleRef) EmitError!void {
         try self.out.appendSlice(self.allocator, "\t");
         try self.out.appendSlice(self.allocator, layout_var);
         try self.out.appendSlice(self.allocator, " := widgets.ParentID(uint32(");
@@ -850,6 +925,9 @@ const Emitter = struct {
                 try self.out.appendSlice(self.allocator, ".ScrollHorizontal = true\n");
             }
         }
+        if (style_names.len > 0) {
+            try self.emitApplyStyleToLayout(layout_var, style_names);
+        }
     }
 
     /// Looks up the `styles={...}` attribute (if any) and resolves its
@@ -913,6 +991,27 @@ const Emitter = struct {
         return out;
     }
 
+    /// The raw `styles={...}` name list (position-carrying `StyleRef`s, not
+    /// yet resolved against `self.style_tokens`) for `el`, or an empty
+    /// slice if the attribute is absent, dynamic, or not a plain name
+    /// list -- computed once per element, right alongside `layoutStyleFor`
+    /// (which resolves the same attribute for the layout-only subset), and
+    /// fed into `emitLayout`'s own atomic style-application call. Doesn't
+    /// itself validate anything -- an unknown token name or a dynamic
+    /// expression are both still caught exactly where they always were
+    /// (`ApplyStyle`'s own runtime lookup; the `else => self.fail(...)`
+    /// arm in the later per-attr loop, respectively).
+    fn namedStyleRefs(el: Parser.Element) []Parser.StyleRef {
+        for (el.attrs) |attr| {
+            if (!std.mem.eql(u8, attr.name, "styles")) continue;
+            return switch (attr.value) {
+                .styles => |n| n,
+                else => &.{},
+            };
+        }
+        return &.{};
+    }
+
     fn directionExpr(d: Resolver.Direction) []const u8 {
         return switch (d) {
             .topToBottom => "widgets.TopToBottom",
@@ -964,7 +1063,7 @@ const Emitter = struct {
         const wrap_var = try std.fmt.allocPrint(self.allocator, "Margin{d}", .{self.counter});
         self.counter += 1;
         const layout_var = try std.fmt.allocPrint(self.allocator, "{s}Layout", .{wrap_var});
-        try self.emitLayout(layout_var, parent_expr, .{ .direction = "widgets.TopToBottom", .child_gap = 0, .padding = margin });
+        try self.emitLayout(layout_var, parent_expr, .{ .direction = "widgets.TopToBottom", .child_gap = 0, .padding = margin }, &.{});
         try self.out.appendSlice(self.allocator, "\t");
         try self.out.appendSlice(self.allocator, wrap_var);
         try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(");
@@ -1351,17 +1450,31 @@ const Emitter = struct {
         // `attach_expr` and `var_name`, just reused per-widget here.
         // Defaults to `var_name` (every other widget's own real id).
         var children_parent_expr: []const u8 = var_name;
-        var image_styles_emitted = false;
+        // 2026-09-10: real style names, resolved atomically into
+        // `layout_var` by `emitLayout` itself (see that function's own doc
+        // comment) rather than via a separate, later, post-creation
+        // `ApplyStyle` call -- closes a real create-then-style race, full
+        // detail in `project_natyv_render_loop_fix` memory. `Window` is
+        // the one real widget kind with no `Layout` at all (a real OS
+        // window isn't a Clay child of anything -- see that branch's own
+        // doc comment), so it's excluded here and still falls through to
+        // the old post-creation path in the per-attr loop below; every
+        // other kind (including `Dialog`/`ToastStack`, both given a real
+        // `Layout` param specifically to close this same gap) now takes
+        // the atomic path automatically, just by virtue of calling
+        // `emitLayout` at all.
+        const style_names = namedStyleRefs(el);
+        const style_handled_atomically = style_names.len > 0 and !std.mem.eql(u8, el.tag, "Window");
 
         if (std.mem.eql(u8, el.tag, "Container")) {
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(");
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ", false, 0)\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "Label")) {
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(300), .height = fixedSizing(24) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(300), .height = fixedSizing(24) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateLabel(");
@@ -1371,7 +1484,7 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attrs = &.{"text"};
         } else if (std.mem.eql(u8, el.tag, "Button")) {
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateButton(");
@@ -1383,7 +1496,7 @@ const Emitter = struct {
         } else if (std.mem.eql(u8, el.tag, "TextField")) {
             const placeholder_attr = try self.stringAttr(el, "placeholder");
             const placeholder = if (placeholder_attr) |pa| pa.value else "";
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(240), .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(240), .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateTextField(");
@@ -1418,7 +1531,7 @@ const Emitter = struct {
             if (text_attr != null and text_child != null) {
                 return self.fail(el.line, el.col, "<TextArea> can't have both a 'text' attribute and literal child text -- pick one", .{});
             }
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(320), .height = fixedSizing(200) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(320), .height = fixedSizing(200) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateTextArea(");
@@ -1444,7 +1557,7 @@ const Emitter = struct {
             }
             skip_attrs = &.{"text"};
         } else if (std.mem.eql(u8, el.tag, "Checkbox")) {
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(24) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(24) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateCheckbox(");
@@ -1459,7 +1572,7 @@ const Emitter = struct {
             // widget id) -- required, since the real constructor has no
             // default for it.
             const group = try self.requiredExprAttr(el, "group");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(24) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(24) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateRadioButton(");
@@ -1471,7 +1584,7 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attrs = &.{ "group", "text" };
         } else if (std.mem.eql(u8, el.tag, "Toggle")) {
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(24) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(24) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateToggle(");
@@ -1483,7 +1596,7 @@ const Emitter = struct {
         } else if (std.mem.eql(u8, el.tag, "Slider")) {
             try self.rejectChildren(el);
             const value = try self.requiredExprAttr(el, "value");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(200), .height = fixedSizing(24) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(200), .height = fixedSizing(24) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateSlider(");
@@ -1497,7 +1610,7 @@ const Emitter = struct {
             const min = try self.requiredExprAttr(el, "min");
             const max = try self.requiredExprAttr(el, "max");
             const step = try self.requiredExprAttr(el, "step");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(200), .height = fixedSizing(24) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(200), .height = fixedSizing(24) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateRangeSlider(");
@@ -1517,7 +1630,7 @@ const Emitter = struct {
             const max = try self.requiredExprAttr(el, "max");
             const step = try self.requiredExprAttr(el, "step");
             const wrap = try self.requiredExprAttr(el, "wrap");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateNumericStepper(");
@@ -1538,7 +1651,7 @@ const Emitter = struct {
             try self.rejectChildren(el);
             const segments = try self.requiredExprAttr(el, "segments");
             const selected = try self.requiredExprAttr(el, "selected");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(240), .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(240), .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateSegmentedControl(");
@@ -1551,7 +1664,7 @@ const Emitter = struct {
             skip_attrs = &.{ "segments", "selected" };
         } else if (std.mem.eql(u8, el.tag, "Divider")) {
             try self.rejectChildren(el);
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(1) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(1) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateDivider(");
@@ -1560,7 +1673,7 @@ const Emitter = struct {
         } else if (std.mem.eql(u8, el.tag, "ProgressBar")) {
             try self.rejectChildren(el);
             const value = try self.requiredExprAttr(el, "value");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(12) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(12) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateProgressBar(");
@@ -1571,7 +1684,7 @@ const Emitter = struct {
             skip_attrs = &.{"value"};
         } else if (std.mem.eql(u8, el.tag, "Badge")) {
             const tone = try self.requiredExprAttr(el, "tone");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(80), .height = fixedSizing(20) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(80), .height = fixedSizing(20) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateBadge(");
@@ -1584,7 +1697,7 @@ const Emitter = struct {
             skip_attrs = &.{ "tone", "text" };
         } else if (std.mem.eql(u8, el.tag, "Spinner")) {
             try self.rejectChildren(el);
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(24), .height = fixedSizing(24) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(24), .height = fixedSizing(24) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateSpinner(");
@@ -1595,7 +1708,7 @@ const Emitter = struct {
             // `CreateContainer(layout, true, 0)` -- accepts children
             // exactly like `<Container>` does (the generic children loop
             // below this whole dispatch chain handles them identically).
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreatePanel(");
@@ -1605,7 +1718,7 @@ const Emitter = struct {
             try self.rejectChildren(el);
             const placeholder_attr = try self.namedTextAttr(el, "placeholder");
             const options = try self.requiredExprAttr(el, "options");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(240), .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(240), .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateCombobox(");
@@ -1622,7 +1735,7 @@ const Emitter = struct {
             skip_attrs = &.{ "placeholder", "options" };
         } else if (std.mem.eql(u8, el.tag, "Dropdown")) {
             const options = try self.requiredExprAttr(el, "options");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateDropdown(");
@@ -1637,7 +1750,7 @@ const Emitter = struct {
             try self.rejectChildren(el);
             const crumbs = try self.requiredExprAttr(el, "crumbs");
             const separator = try self.requiredNamedTextAttr(el, "separator");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(24) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(24) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateBreadcrumbs(");
@@ -1650,7 +1763,7 @@ const Emitter = struct {
             skip_attrs = &.{ "crumbs", "separator" };
         } else if (std.mem.eql(u8, el.tag, "Menu")) {
             const items = try self.requiredExprAttr(el, "items");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateMenu(");
@@ -1666,7 +1779,7 @@ const Emitter = struct {
             const entries = try self.requiredExprAttr(el, "entries");
             const item_width = try self.requiredExprAttr(el, "itemWidth");
             const item_height = try self.requiredExprAttr(el, "itemHeight");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateMenuBar(");
@@ -1684,7 +1797,7 @@ const Emitter = struct {
             const columns = try self.requiredExprAttr(el, "columns");
             const rows = try self.requiredExprAttr(el, "rows");
             const row_height = try self.requiredExprAttr(el, "rowHeight");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(240) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(240) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateTable(");
@@ -1701,7 +1814,7 @@ const Emitter = struct {
             try self.rejectChildren(el);
             const roots = try self.requiredExprAttr(el, "roots");
             const row_height = try self.requiredExprAttr(el, "rowHeight");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(240) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(240) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateTree(");
@@ -1747,21 +1860,31 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attrs = &.{ "title", "width", "height" };
         } else if (std.mem.eql(u8, el.tag, "Dialog")) {
-            // No `Layout` (geometry is hardcoded inside `CreateDialog`:
-            // 280px wide, Fit height -- see dialog.go) -- same no-`Layout`
-            // shape as `Window`/`ToastStack` above. Self-closing:
-            // `CreateDialog` builds its own title/message/button-row
-            // internally, so there's nothing for real `.ntx` children to
-            // attach to (same posture `<Image>` already has). `Dialog`
-            // returns a plain value (like `Breadcrumbs`), not a pointer --
-            // see `struct_backed_widget_kinds`'s own doc comment.
+            // Self-closing: `CreateDialog` builds its own title/message/
+            // button-row internally, so there's nothing for real `.ntx`
+            // children to attach to (same posture `<Image>` already has).
+            // `Dialog` returns a plain value (like `Breadcrumbs`), not a
+            // pointer -- see `struct_backed_widget_kinds`'s own doc
+            // comment. 2026-09-10: now takes a real `Layout` (280px wide,
+            // Fit height, 16px padding, 12px gap -- `CreateDialog`'s own
+            // former hardcoded defaults, moved here to match every other
+            // widget kind's convention exactly) instead of no `Layout` at
+            // all, so `styles={}` resolves atomically via `emitLayout`
+            // before creation -- closes the same create-then-style race
+            // `Window` still has no `Layout` to close at all. Direction/
+            // Modal stay forced inside `CreateDialog` itself regardless of
+            // what `styles={}` sets, same reasoning that function's own
+            // doc comment gives.
             try self.rejectChildren(el);
             const title = try self.namedTextAttr(el, "title");
             const message = try self.requiredNamedTextAttr(el, "message");
             const button_labels = try self.requiredExprAttr(el, "buttonLabels");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(280), .height = fitSizing(), .padding = 16, .child_gap = 12 }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateDialog(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
             if (title) |t| {
                 try self.emitNamedTextAttrValue(t);
             } else {
@@ -1774,16 +1897,28 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attrs = &.{ "title", "message", "buttonLabels" };
         } else if (std.mem.eql(u8, el.tag, "ToastStack")) {
-            // No `Layout` (`CreateToastStack` takes only a bare `childGap`
-            // -- see toast.go). Self-closing, `ref`-bound: toasts
-            // themselves are never created via markup, only later via
-            // `.Show(...)` from hand-written Go once `ref={&x}` has bound
-            // this stack -- same posture as `Window` above.
+            // Self-closing, `ref`-bound: toasts themselves are never
+            // created via markup, only later via `.Show(...)` from hand-
+            // written Go once `ref={&x}` has bound this stack -- same
+            // posture as `Window` above. 2026-09-10: now takes a real
+            // `Layout` (empty `LayoutDefaults` here -- `CreateToastStack`
+            // itself always forces Fit/Fit sizing, top-to-bottom
+            // direction, and Toast-anchoring regardless of what `layout`
+            // carries in, so there's nothing useful to default at the
+            // codegen level beyond letting `styles={}` resolve atomically
+            // via `emitLayout`) instead of no `Layout` at all, same
+            // create-then-style-race reasoning as `Dialog` above.
+            // `childGap` stays its own explicit expression argument, not
+            // folded into `layout` -- see `CreateToastStack`'s own doc
+            // comment for why.
             try self.rejectChildren(el);
             const child_gap = try self.requiredExprAttr(el, "childGap");
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{}, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateToastStack(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
             try self.emitExprAttrValue(child_gap);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attrs = &.{"childGap"};
@@ -1798,7 +1933,7 @@ const Emitter = struct {
             try self.rejectChildren(el);
             const labels = try self.requiredExprAttr(el, "labels");
             const selected_index = try self.requiredExprAttr(el, "selectedIndex");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateTabs(");
@@ -1823,7 +1958,7 @@ const Emitter = struct {
             // like a plain `<Container>` -- no further special-casing
             // needed past the constructor call itself.
             const tabs = try self.requiredExprAttr(el, "tabs");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateTabPanel(");
@@ -1852,8 +1987,8 @@ const Emitter = struct {
             const background = try self.requiredExprAttr(el, "background");
             const header_layout_var = try std.fmt.allocPrint(self.allocator, "{s}HeaderLayout", .{var_name});
             const content_layout_var = try std.fmt.allocPrint(self.allocator, "{s}ContentLayout", .{var_name});
-            try self.emitLayout(header_layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
-            try self.emitLayout(content_layout_var, attach_expr, .{ .direction = "widgets.TopToBottom", .width = .{ .kind = .grow, .value = 0 }, .height = fitSizing() });
+            try self.emitLayout(header_layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style), style_names);
+            try self.emitLayout(content_layout_var, attach_expr, .{ .direction = "widgets.TopToBottom", .width = .{ .kind = .grow, .value = 0 }, .height = fitSizing() }, &.{});
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateAccordionSection(");
@@ -1880,7 +2015,7 @@ const Emitter = struct {
             // the outer panel, matching `CreateCard`'s own single-`Layout`
             // shape (unlike AccordionSection's two).
             const title = try self.namedTextAttr(el, "title");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateCard(");
@@ -1904,7 +2039,7 @@ const Emitter = struct {
             const width = try self.requiredExprAttr(el, "width");
             const height = try self.requiredExprAttr(el, "height");
             const message = try self.requiredNamedTextAttr(el, "message");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateTooltip(");
@@ -1933,7 +2068,7 @@ const Emitter = struct {
             const month = try self.requiredExprAttr(el, "month");
             const hour = try self.requiredExprAttr(el, "hour");
             const minute = try self.requiredExprAttr(el, "minute");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(160), .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateDateTimePicker(");
@@ -1966,7 +2101,7 @@ const Emitter = struct {
             // `consumesTextChildren`).
             const panel_width = try self.requiredExprAttr(el, "panelWidth");
             const build = try self.requiredExprAttr(el, "build");
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreatePopover(");
@@ -1994,8 +2129,21 @@ const Emitter = struct {
             // A leaf widget like Label/Button, not a layout container --
             // 300x200 is a plain, reasonable default "image box" size
             // (no real sizing/layout attribute grammar exists yet, see the
-            // LayoutDefaults doc comment above), not a real design.
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(300), .height = fixedSizing(200) }, layout_style));
+            // LayoutDefaults doc comment above), not a real design. Passed
+            // an empty style_names here (not the real one) -- <Image>
+            // needs the texture-overriding shape below instead of the
+            // generic atomic call this would otherwise emit.
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(300), .height = fixedSizing(200) }, layout_style), &.{});
+            // Atomic, pre-creation counterpart to the old post-creation
+            // emitApplyStyleWithTexture call -- same "close the create-
+            // then-style race" reasoning as every other widget kind now
+            // gets via emitLayout, just applied by hand here since <Image>
+            // needs the texture-overriding call shape. Emitted
+            // unconditionally (matches the old code's own "a bare <Image
+            // src=...> with no styles= still needs its texture applied"
+            // posture) -- the later per-attr loop's own `styles` case
+            // skips re-emitting for any image tag, see its own comment.
+            try self.emitApplyStyleToLayoutWithTexture(layout_var, style_names, image_texture_id);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(");
@@ -2019,16 +2167,27 @@ const Emitter = struct {
             if (isSkippedAttr(attr.name, skip_attrs)) continue;
             if (std.mem.eql(u8, attr.name, "styles")) {
                 switch (attr.value) {
+                    // 2026-09-10: the real, non-dynamic case is already
+                    // fully handled above, atomically, before this widget
+                    // was even created -- `<Image>` via its own direct,
+                    // unconditional emitApplyStyleToLayoutWithTexture call,
+                    // every other kind via emitLayout's own call
+                    // (style_handled_atomically is true iff that fired).
+                    // Only `Window` (no Layout at all, see this file's own
+                    // doc comment on that branch) still needs the old
+                    // post-creation path here. The `else` arm below (a
+                    // dynamic styles expression) still needs to fire
+                    // regardless -- that's a real, distinct error unrelated
+                    // to atomic-vs-not.
                     .styles => |names| {
-                        if (is_image_tag) {
-                            try self.emitApplyStyleWithTexture(var_name, names, image_texture_id);
-                            image_styles_emitted = true;
-                        } else if (isStructBackedWidgetKind(el.tag)) {
-                            const id_expr = try std.fmt.allocPrint(self.allocator, "{s}.ID()", .{var_name});
-                            try self.emitApplyStyle(id_expr, names);
-                        } else {
-                            const id_expr = try std.fmt.allocPrint(self.allocator, "uint32({s})", .{var_name});
-                            try self.emitApplyStyle(id_expr, names);
+                        if (!is_image_tag and !style_handled_atomically) {
+                            if (isStructBackedWidgetKind(el.tag)) {
+                                const id_expr = try std.fmt.allocPrint(self.allocator, "{s}.ID()", .{var_name});
+                                try self.emitApplyStyle(id_expr, names);
+                            } else {
+                                const id_expr = try std.fmt.allocPrint(self.allocator, "uint32({s})", .{var_name});
+                                try self.emitApplyStyle(id_expr, names);
+                            }
                         }
                     },
                     else => return self.fail(attr.line, attr.col, "dynamic 'styles' expressions aren't supported until a future stage", .{}),
@@ -2055,12 +2214,12 @@ const Emitter = struct {
                 return self.fail(attr.line, attr.col, "attribute '{s}' isn't supported yet", .{attr.name});
             }
         }
-        // A bare <Image src="..."/> with no styles={} attribute at all
-        // still needs its texture applied -- the branch above only fires
-        // when a real 'styles' attribute is present on the tag.
-        if (is_image_tag and !image_styles_emitted) {
-            try self.emitApplyStyleWithTexture(var_name, &.{}, image_texture_id);
-        }
+        // 2026-09-10: <Image>'s own branch above now unconditionally emits
+        // its atomic emitApplyStyleToLayoutWithTexture call (styles={} or
+        // not -- a bare <Image src="..."/> still needs its texture
+        // applied), so there's no longer a "styles={} was present but
+        // Image wasn't styled yet" gap to backfill here the way the old
+        // post-creation design had.
 
         if (!consumesTextChildren(el.tag)) {
             for (el.children) |child| {
@@ -2366,7 +2525,7 @@ test "generates a builder function and a spliced logic file for a single flat co
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "func natyvBuildNavBar(parent widgets.Container) error {") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "Container0Layout := widgets.ParentID(uint32(parent))") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "widgets.CreateContainer(Container0Layout, false, 0)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.generated, "widgets.ApplyStyle(uint32(Container0), StyleTokens, \"nav\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.generated, "widgets.ApplyStyleToLayout(&Container0Layout, StyleTokens, \"nav\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "widgets.CreateLabel(Label1Layout, \"Home\")") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, out.logic, "expose NavBar") == null);
@@ -2969,7 +3128,7 @@ test "styles naming a token with margin inserts a wrapper Container, transparent
     try std.testing.expect(std.mem.indexOf(u8, gen, "Margin0, err := widgets.CreateContainer(Margin0Layout, false, 0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "Label1Layout := widgets.ParentID(uint32(Margin0))") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateLabel(Label1Layout, \"hi\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyle(uint32(Label1), StyleTokens, \"card\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyleToLayout(&Label1Layout, StyleTokens, \"card\")") != null);
 }
 
 test "a token with no margin never inserts a wrapper" {
@@ -3512,7 +3671,7 @@ test "<Image src=...> with no styles= still applies its texture, background true
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateContainer(Image0Layout, true, 0)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyleWithTexture(uint32(Image0), StyleTokens, 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyleToLayoutWithTexture(&Image0Layout, StyleTokens, 0)") != null);
 }
 
 test "<Image src=...> with styles= merges names, src's texture still applied via the same call" {
@@ -3533,7 +3692,7 @@ test "<Image src=...> with styles= merges names, src's texture still applied via
     const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, image_texture_ids);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
-    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyleWithTexture(uint32(Image0), StyleTokens, 2, \"card\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyleToLayoutWithTexture(&Image0Layout, StyleTokens, 2, \"card\")") != null);
 }
 
 test "<Image> requires a src attribute" {
@@ -3960,7 +4119,7 @@ test "<Dropdown styles={...}/> targets .ID(), not uint32(...) -- Dropdown isn't 
     defer arena.deinit();
     const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Dropdown styles={nav} options={opts}>Pick one</Dropdown>\n}\n");
     try std.testing.expect(r.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.ApplyStyle(Dropdown0.ID(), StyleTokens, \"nav\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.ApplyStyleToLayout(&Dropdown0Layout, StyleTokens, \"nav\")") != null);
 }
 
 test "<Dropdown ref={&x}/> assigns the already-pointer var directly, no extra &" {
@@ -4023,7 +4182,7 @@ test "<Table styles={...}/> also targets .ID() -- covers the pointer-returning f
     defer arena.deinit();
     const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Table styles={nav} columns={cols} rows={data} rowHeight={24} />\n}\n");
     try std.testing.expect(r.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.ApplyStyle(Table0.ID(), StyleTokens, \"nav\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.ApplyStyleToLayout(&Table0Layout, StyleTokens, \"nav\")") != null);
 }
 
 test "<Breadcrumbs crumbs={} separator=\"/\" /> forwards both real args" {
@@ -4039,7 +4198,7 @@ test "<Breadcrumbs styles={...}/> also targets .ID() -- CreateBreadcrumbs return
     defer arena.deinit();
     const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Breadcrumbs styles={nav} crumbs={path} separator=\"/\" />\n}\n");
     try std.testing.expect(r.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.ApplyStyle(Breadcrumbs0.ID(), StyleTokens, \"nav\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.ApplyStyleToLayout(&Breadcrumbs0Layout, StyleTokens, \"nav\")") != null);
 }
 
 test "<Breadcrumbs ref={&x}/> still uses & -- CreateBreadcrumbs returns a value, unlike Dropdown/Table/..." {
@@ -4110,13 +4269,17 @@ test "<Window> rejects children" {
     try std.testing.expect(r.err != null);
 }
 
-test "<Dialog title=\"...\" message=\"...\" buttonLabels={} /> forwards all three, no Layout line" {
+test "<Dialog title=\"...\" message=\"...\" buttonLabels={} /> forwards all three, real Layout line" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Dialog title=\"Confirm\" message=\"Are you sure?\" buttonLabels={labels} />\n}\n");
     try std.testing.expect(r.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateDialog(\"Confirm\", \"Are you sure?\", labels)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "Dialog0Layout") == null);
+    // 2026-09-10: Dialog now takes a real Layout (see CreateDialog's own
+    // doc comment for why -- closes the create-then-style race) instead
+    // of none at all, so its own generated call now leads with
+    // Dialog0Layout, and a real Layout line exists to carry it.
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateDialog(Dialog0Layout, \"Confirm\", \"Are you sure?\", labels)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "Dialog0Layout := widgets.ParentID(") != null);
 }
 
 test "<Dialog styles={...}/> targets .ID() -- Dialog returns a plain value, still not uint32-based" {
@@ -4128,7 +4291,7 @@ test "<Dialog styles={...}/> targets .ID() -- Dialog returns a plain value, stil
     const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "nav", .background_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } }};
     const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyle(Dialog0.ID(), StyleTokens, \"nav\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyleToLayout(&Dialog0Layout, StyleTokens, \"nav\")") != null);
 }
 
 test "<ToastStack ref={&x} childGap={8} /> assigns the already-pointer var directly, no extra &" {
@@ -4136,10 +4299,12 @@ test "<ToastStack ref={&x} childGap={8} /> assigns the already-pointer var direc
     defer arena.deinit();
     const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <ToastStack ref={&myStack} childGap={8} />\n}\n");
     try std.testing.expect(r.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateToastStack(8)") != null);
+    // 2026-09-10: ToastStack now takes a real Layout too (see
+    // CreateToastStack's own doc comment), so childGap is now the
+    // *second* argument, preceded by ToastStack0Layout.
+    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateToastStack(ToastStack0Layout, 8)") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myStack = ToastStack0") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "myStack = &ToastStack0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "ToastStack0Layout") == null);
 }
 
 test "<Tabs labels={} selectedIndex={} /> DOES emit a real Layout line, unlike Window/Dialog/ToastStack" {
@@ -4224,7 +4389,7 @@ test "<Card styles={...}/> targets .ID(), distinct from .ContentID()" {
     const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "nav", .background_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } }};
     const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyle(Card0.ID(), StyleTokens, \"nav\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyleToLayout(&Card0Layout, StyleTokens, \"nav\")") != null);
 }
 
 test "<Popover>Open</Popover> uses child text as the trigger label, forwards panelWidth/build" {
@@ -4270,7 +4435,7 @@ test "<Tooltip styles={...}/> targets .ID()" {
     const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "nav", .background_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } }};
     const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyle(Tooltip0.ID(), StyleTokens, \"nav\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyleToLayout(&Tooltip0Layout, StyleTokens, \"nav\")") != null);
 }
 
 test "<DateTimePicker>Pick a date</DateTimePicker> uses child text as the trigger label, forwards year/month/hour/minute" {
