@@ -160,6 +160,58 @@ pub const Output = struct {
     /// and the real, on-disk logic file (where hand-written code like an
     /// `onClick` handler's own body actually lives, untouched by codegen).
     edits: []const Edit,
+    /// Part 2 (codegen automation for handler reattachment): one entry per
+    /// qualifying `ref={&x}` target this file's composers produced (only
+    /// ever populated when `recycle_enabled`) -- consumed by `Prepare.zig`'s
+    /// whole-app aggregation pass, since ref-persistence spans every
+    /// `.ntx` file in an app, not just this one (see `natyv_generated.go`).
+    ref_persist_entries: []const RefPersistEntry = &.{},
+    /// Same aggregation shape as `ref_persist_entries`, for the 9
+    /// struct-backed widget kinds' tier-2/3 accessor-based reattachment.
+    struct_backed_snapshot_entries: []const StructBackedSnapshotEntry = &.{},
+};
+
+/// One auto-generated or escape-hatch-driven binding site, collected
+/// during `emitElement`'s per-attribute loop and consumed once, at the end
+/// of `generateGo`, to emit that site's rebind function (only ever
+/// populated for the "safe auto" case -- see `emitElement`'s own hook;
+/// `bindKind=`/`bindArgs=` sites supply their own hand-written rebind
+/// function and never appear here).
+pub const PendingRebind = struct {
+    kind: []const u8,
+    widget_tag: []const u8,
+    attr_name: []const u8,
+    handler_name: []const u8,
+    /// Raw expression text for a tier-1 struct-backed kind's extra `WrapX`
+    /// argument (e.g. Dropdown's `options=`), re-spliced verbatim into the
+    /// rebind function -- empty for every non-struct-backed kind.
+    extra_wrap_args: []const []const u8 = &.{},
+};
+
+/// One package-level `ref={&x}` target qualifying for Mechanism 1's
+/// unconditional ref-auto-persistence (non-struct-backed kinds only --
+/// see `Output.ref_persist_entries`'s own doc comment).
+pub const RefPersistEntry = struct {
+    /// The `.ntx` tag name, e.g. "TextField" -- doubles as the Go SDK type
+    /// name for every built-in widget kind (confirmed identical for all of
+    /// them), so no separate type-name lookup table is needed.
+    widget_kind: []const u8,
+    /// The package-level Go identifier `ref=` assigned to -- already
+    /// unique by the Go compiler's own rules, so this alone is a safe
+    /// `Persisted[T]` key with no `composer_name` folding needed.
+    target_name: []const u8,
+};
+
+/// One struct-backed-widget `ref={&x}` target (tier 2/3: MenuBar/Dialog/
+/// Breadcrumbs/DateTimePicker/Table/Tree) qualifying for the accessor-
+/// based reattachment mechanism -- see `Output.struct_backed_snapshot_entries`.
+pub const StructBackedSnapshotEntry = struct {
+    widget_kind: []const u8,
+    target_name: []const u8,
+    /// The new SDK accessor method's name (e.g. "TriggerIDs", "Snapshot")
+    /// -- `natyv_generated.go`'s own aggregation calls this on the
+    /// dereferenced ref'd handle.
+    accessor_method: []const u8,
 };
 
 /// The real LSP semantic-token types this server advertises (a small
@@ -308,6 +360,192 @@ fn leadingIdent(segment: []const u8) ?[]const u8 {
     return segment[0..end];
 }
 
+/// Iterates every maximal identifier-shaped substring in `text`
+/// (`[A-Za-z_][A-Za-z0-9_]*`) -- shared by `collectRawCodeLocals` (finding
+/// declarations) and `isSafeToResplice` (checking whether an arbitrary
+/// expression references a composer param or a raw-code-block local).
+const IdentTokenIterator = struct {
+    text: []const u8,
+    pos: usize = 0,
+
+    fn next(self: *IdentTokenIterator) ?[]const u8 {
+        while (self.pos < self.text.len and !isIdentStart(self.text[self.pos])) : (self.pos += 1) {}
+        if (self.pos >= self.text.len) return null;
+        const start = self.pos;
+        self.pos += 1;
+        while (self.pos < self.text.len and isIdentCont(self.text[self.pos])) : (self.pos += 1) {}
+        return self.text[start..self.pos];
+    }
+};
+
+fn identTokensIn(text: []const u8) IdentTokenIterator {
+    return .{ .text = text };
+}
+
+/// Part 2 (codegen automation): true only when every identifier token in
+/// `expr` is neither one of `composer_params` nor `composer_raw_code_locals`
+/// -- the shared classifier behind both the "safe auto" handler check and
+/// the tier-1 struct-backed resplice check. Not a real Go parser: a
+/// self-contained literal with zero identifier tokens (e.g.
+/// `[]string{"5","10","20"}`) trivially passes, since it can't reference
+/// anything unsafe by construction.
+fn isSafeToResplice(expr: []const u8, composer_params: []const []const u8, composer_raw_code_locals: []const []const u8) bool {
+    var it = identTokensIn(expr);
+    while (it.next()) |tok| {
+        for (composer_params) |p| {
+            if (std.mem.eql(u8, tok, p)) return false;
+        }
+        for (composer_raw_code_locals) |l| {
+            if (std.mem.eql(u8, tok, l)) return false;
+        }
+    }
+    return true;
+}
+
+/// True when `code[pos..]` starts with `keyword` as a real, standalone
+/// token -- not part of a larger identifier on either side (e.g. `variable`
+/// must not match `var`).
+fn matchesKeywordAt(code: []const u8, pos: usize, keyword: []const u8) bool {
+    if (pos + keyword.len > code.len) return false;
+    if (!std.mem.eql(u8, code[pos .. pos + keyword.len], keyword)) return false;
+    if (pos > 0 and isIdentCont(code[pos - 1])) return false;
+    const after = pos + keyword.len;
+    if (after < code.len and isIdentCont(code[after])) return false;
+    return true;
+}
+
+/// Appends the first identifier token found in `segment` to `out` -- Go
+/// always puts a parameter's own name first within its comma-separated
+/// segment, whether or not a type follows (`x`, `x int`, `x, y int`'s own
+/// `y int` segment).
+fn appendFirstIdentInSegment(allocator: std.mem.Allocator, segment: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var k: usize = 0;
+    while (k < segment.len and !isIdentStart(segment[k])) : (k += 1) {}
+    if (k >= segment.len) return;
+    const start = k;
+    k += 1;
+    while (k < segment.len and isIdentCont(segment[k])) : (k += 1) {}
+    try out.append(allocator, segment[start..k]);
+}
+
+/// Part 2 (codegen automation), the raw-code-block-local lexical scan --
+/// **deliberately not a real Go parser**. Scans one raw-code block's own
+/// opaque `.code` text for three declaration shapes and appends every
+/// apparent local name to `out`: `:=` (walrus, including multi-assign and
+/// `for x := range ...` -- found by walking backward from the `:=` over a
+/// comma-separated identifier list); `var` (collecting the comma-separated
+/// name list immediately following it, stopping at the first non-
+/// identifier/non-comma character -- an optional type or `= value` never
+/// gets misread as another name); and `func(...)` closure-literal
+/// parameters (the first identifier in each comma-separated segment up to
+/// the matching `)`).
+///
+/// Deliberately over-inclusive by design, not by accident: a false
+/// positive here (treating something as "maybe a local" when it's really
+/// a package-level function) only ever falls through to requiring the
+/// `bindKind=`/`bindArgs=` escape hatch -- a safe, non-breaking outcome.
+/// A false negative is the real danger (silently generating a reference to
+/// an undefined identifier), so this errs toward collecting more names,
+/// not fewer. Duplicate entries in `out` are harmless -- it's only ever
+/// used as a membership test.
+fn collectRawCodeLocals(allocator: std.mem.Allocator, code: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var i: usize = 0;
+    while (i < code.len) {
+        if (i + 1 < code.len and code[i] == ':' and code[i + 1] == '=') {
+            var j = i;
+            var names: std.ArrayList([]const u8) = .empty;
+            defer names.deinit(allocator);
+            while (j > 0) {
+                while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t' or code[j - 1] == '\n' or code[j - 1] == '\r')) j -= 1;
+                if (j == 0 or !isIdentCont(code[j - 1])) break;
+                const end = j;
+                while (j > 0 and isIdentCont(code[j - 1])) j -= 1;
+                if (j < end and isIdentStart(code[j])) try names.append(allocator, code[j..end]);
+                while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
+                if (j > 0 and code[j - 1] == ',') {
+                    j -= 1;
+                    continue;
+                }
+                break;
+            }
+            for (names.items) |n| try out.append(allocator, n);
+            i += 2;
+            continue;
+        }
+        if (matchesKeywordAt(code, i, "var")) {
+            var j = i + 3;
+            while (true) {
+                while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+                if (j >= code.len or !isIdentStart(code[j])) break;
+                const start = j;
+                j += 1;
+                while (j < code.len and isIdentCont(code[j])) : (j += 1) {}
+                try out.append(allocator, code[start..j]);
+                while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+                if (j < code.len and code[j] == ',') {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            i += 3;
+            continue;
+        }
+        if (matchesKeywordAt(code, i, "func")) {
+            var j = i + 4;
+            while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+            if (j < code.len and code[j] == '(') {
+                j += 1;
+                var depth: u32 = 1;
+                var seg_start = j;
+                while (j < code.len and depth > 0) {
+                    switch (code[j]) {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if (depth == 0) try appendFirstIdentInSegment(allocator, code[seg_start..j], out);
+                        },
+                        ',' => if (depth == 1) {
+                            try appendFirstIdentInSegment(allocator, code[seg_start..j], out);
+                            seg_start = j + 1;
+                        },
+                        else => {},
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            i += 4;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Recursively walks a composer's parsed `Node` tree, running
+/// `collectRawCodeLocals` over every `<%...%>` raw-code block's own
+/// `.code` segments -- nested tags' own attribute expressions (`.tag`
+/// segments) are never scanned, only recursed into for further nested
+/// raw-code blocks, since a tag's attribute values are real, separately-
+/// parsed expressions, never part of any `.code` slice.
+fn collectRawCodeLocalsFromNode(allocator: std.mem.Allocator, node: Parser.Node, out: *std.ArrayList([]const u8)) !void {
+    switch (node) {
+        .element => |el| {
+            for (el.children) |child| try collectRawCodeLocalsFromNode(allocator, child, out);
+        },
+        .raw_code => |raw| {
+            for (raw.segments) |seg| {
+                switch (seg) {
+                    .code => |code| try collectRawCodeLocals(allocator, code, out),
+                    .tag => |el| for (el.children) |child| try collectRawCodeLocalsFromNode(allocator, child, out),
+                }
+            }
+        },
+        .text => {},
+    }
+}
+
 const EmitError = error{CodegenError} || std.mem.Allocator.Error;
 
 const Emitter = struct {
@@ -359,6 +597,50 @@ const Emitter = struct {
     body_col: u32 = 1,
     counter: u32 = 0,
     err: ?CodegenError = null,
+
+    /// The owning composer's own name -- needed because `counter` (and
+    /// therefore `var_name`, e.g. "Button2") resets per composer, not
+    /// file-wide, so a binding "kind" string derived from `var_name` alone
+    /// isn't file-unique. See `RegisterBinding`'s auto-derived kind.
+    composer_name: []const u8 = "",
+    /// The owning composer's own declared parameter names (not full
+    /// signature text) -- lets a handler/bindArgs expression be classified
+    /// as "references something only the caller knows," see
+    /// `isSafeToResplice`.
+    composer_params: []const []const u8 = &.{},
+    /// Every apparent local name declared inside this composer's own
+    /// `<%...%>` raw-code blocks (via `:=`, `var`, or a closure literal's
+    /// own parameters) -- a real, deliberately conservative lexical scan,
+    /// not a Go parser (see `collectRawCodeLocals`'s own doc comment).
+    /// Feeds the same `isSafeToResplice` check `composer_params` does.
+    composer_raw_code_locals: []const []const u8 = &.{},
+    /// Whether the owning app opted into `recycle_threshold_mb` -- gates
+    /// every RegisterBinding/ref-persistence emission added by this whole
+    /// mechanism to a pure no-op when false, so an app that hasn't opted
+    /// in gets byte-identical output to before this feature existed.
+    recycle_enabled: bool = false,
+    /// Every auto-generated or escape-hatch-driven binding site collected
+    /// across the whole file, shared across every `Emitter` for this file
+    /// (including nested `child_emitter`s) the same way `used_paths` is --
+    /// consumed once, at the end of `generateGo`, to emit each rebind
+    /// function plus one `init()` registering all of them.
+    pending_rebinds: *std.ArrayList(PendingRebind),
+    /// Flips true the instant any `natyv.RegisterBinding`/`Persisted`-
+    /// backed call is actually emitted -- gates the conditional
+    /// `natyv "github.com/natyv-io/sdks/go"` import the same precise way
+    /// `used_paths` gates the `uses`-derived imports, not the fragile
+    /// `"widgets."` substring scan `generateGo`'s own import assembly
+    /// otherwise uses.
+    uses_natyv_root: *bool,
+    /// One entry per qualifying `ref={&x}` target this file's composers
+    /// produce (Mechanism 1) -- shared across every `Emitter` for this
+    /// file, consumed once at the end of `generateGo` to populate
+    /// `Output.ref_persist_entries`.
+    ref_persist_entries: *std.ArrayList(RefPersistEntry),
+    /// One entry per qualifying struct-backed-widget `ref={&x}` target
+    /// (tier 2/3, e.g. MenuBar/Table) -- same sharing/consumption shape as
+    /// `ref_persist_entries`, populates `Output.struct_backed_snapshot_entries`.
+    struct_backed_snapshot_entries: *std.ArrayList(StructBackedSnapshotEntry),
 
     fn fail(self: *Emitter, line: u32, col: u32, comptime fmt: []const u8, args: anytype) EmitError {
         self.err = .{ .line = line, .col = col, .message = std.fmt.allocPrint(self.allocator, fmt, args) catch fmt };
@@ -1284,7 +1566,28 @@ const Emitter = struct {
             const child_var = try std.fmt.allocPrint(self.allocator, "p{d}", .{self.counter});
             self.counter += 1;
             var body: std.ArrayList(u8) = .empty;
-            var child_emitter: Emitter = .{ .allocator = self.allocator, .out = &body, .style_tokens = self.style_tokens, .composers = self.composers, .uses = self.uses, .used_paths = self.used_paths, .mappings = self.mappings, .semantic_tokens = self.semantic_tokens, .body_line = self.body_line, .body_col = self.body_col, .counter = self.counter, .image_texture_ids = self.image_texture_ids };
+            var child_emitter: Emitter = .{
+                .allocator = self.allocator,
+                .out = &body,
+                .style_tokens = self.style_tokens,
+                .composers = self.composers,
+                .uses = self.uses,
+                .used_paths = self.used_paths,
+                .mappings = self.mappings,
+                .semantic_tokens = self.semantic_tokens,
+                .body_line = self.body_line,
+                .body_col = self.body_col,
+                .counter = self.counter,
+                .image_texture_ids = self.image_texture_ids,
+                .composer_name = self.composer_name,
+                .composer_params = self.composer_params,
+                .composer_raw_code_locals = self.composer_raw_code_locals,
+                .recycle_enabled = self.recycle_enabled,
+                .pending_rebinds = self.pending_rebinds,
+                .uses_natyv_root = self.uses_natyv_root,
+                .ref_persist_entries = self.ref_persist_entries,
+                .struct_backed_snapshot_entries = self.struct_backed_snapshot_entries,
+            };
             // Every mapping `child_emitter` records below is relative to
             // `body`, not `args` -- a real, distinct sub-shift, since
             // `body.items` itself gets spliced into `args` at whatever
@@ -2289,7 +2592,7 @@ fn applyEdits(allocator: std.mem.Allocator, src: []const u8, edits: []Edit) ![]c
     return out.toOwnedSlice(allocator);
 }
 
-pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: []const u8, composers: []const Expose.Composer, style_tokens: []const Resolver.ResolvedStyleToken, uses: []const Expose.UseImport, uses_start: usize, uses_end: usize, image_texture_ids: std.StringHashMapUnmanaged(u32)) !struct { output: ?Output, err: ?CodegenError } {
+pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: []const u8, composers: []const Expose.Composer, style_tokens: []const Resolver.ResolvedStyleToken, uses: []const Expose.UseImport, uses_start: usize, uses_end: usize, image_texture_ids: std.StringHashMapUnmanaged(u32), recycle_enabled: bool) !struct { output: ?Output, err: ?CodegenError } {
     const hash_hex = sourceHashHex(src);
 
     for (uses) |u| {
@@ -2360,6 +2663,19 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
     var semantic_tokens: std.ArrayList(SemanticToken) = .empty;
     errdefer semantic_tokens.deinit(allocator);
 
+    // Part 2 (codegen automation for handler reattachment) -- shared
+    // across every `Emitter` for this file the same way `used_paths` is.
+    // See `PendingRebind`/`RefPersistEntry`/`StructBackedSnapshotEntry`'s
+    // own doc comments; all four stay empty (and everything below is a
+    // pure no-op) when `!recycle_enabled`.
+    var pending_rebinds: std.ArrayList(PendingRebind) = .empty;
+    errdefer pending_rebinds.deinit(allocator);
+    var uses_natyv_root: bool = false;
+    var ref_persist_entries: std.ArrayList(RefPersistEntry) = .empty;
+    errdefer ref_persist_entries.deinit(allocator);
+    var struct_backed_snapshot_entries: std.ArrayList(StructBackedSnapshotEntry) = .empty;
+    errdefer struct_backed_snapshot_entries.deinit(allocator);
+
     for (composers) |composer| {
         if (!std.mem.eql(u8, composer.return_type, "error")) {
             return .{ .output = null, .err = .{
@@ -2402,7 +2718,41 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
             } };
         };
 
-        var emitter: Emitter = .{ .allocator = allocator, .out = &body, .style_tokens = style_tokens, .composers = composer_names.items, .uses = uses, .used_paths = &used_paths, .mappings = &mappings, .semantic_tokens = &semantic_tokens, .body_line = composer.body_line, .body_col = composer.body_col, .image_texture_ids = image_texture_ids };
+        // Part 2 (codegen automation): the composer's own declared param
+        // names (not full signature text -- see `Emitter.composer_params`)
+        // plus every apparent local its own `<%...%>` raw-code blocks
+        // declare (see `collectRawCodeLocalsFromNode`) -- both real,
+        // deliberately-cheap-to-compute inputs to `isSafeToResplice`.
+        var composer_param_names: std.ArrayList([]const u8) = .empty;
+        errdefer composer_param_names.deinit(allocator);
+        for (param_segments) |seg| {
+            if (leadingIdent(seg)) |name| try composer_param_names.append(allocator, name);
+        }
+        var composer_raw_code_locals: std.ArrayList([]const u8) = .empty;
+        errdefer composer_raw_code_locals.deinit(allocator);
+        try collectRawCodeLocalsFromNode(allocator, node, &composer_raw_code_locals);
+
+        var emitter: Emitter = .{
+            .allocator = allocator,
+            .out = &body,
+            .style_tokens = style_tokens,
+            .composers = composer_names.items,
+            .uses = uses,
+            .used_paths = &used_paths,
+            .mappings = &mappings,
+            .semantic_tokens = &semantic_tokens,
+            .body_line = composer.body_line,
+            .body_col = composer.body_col,
+            .image_texture_ids = image_texture_ids,
+            .composer_name = composer.name,
+            .composer_params = composer_param_names.items,
+            .composer_raw_code_locals = composer_raw_code_locals.items,
+            .recycle_enabled = recycle_enabled,
+            .pending_rebinds = &pending_rebinds,
+            .uses_natyv_root = &uses_natyv_root,
+            .ref_persist_entries = &ref_persist_entries,
+            .struct_backed_snapshot_entries = &struct_backed_snapshot_entries,
+        };
         _ = emitter.emitElement(node.element, parent_name) catch |e| {
             if (e == error.CodegenError) {
                 const eerr = emitter.err.?;
@@ -2516,7 +2866,7 @@ test "generates a builder function and a spliced logic file for a single flat co
 
     const found = try Expose.findComposers(allocator, src);
     try std.testing.expect(found.err == null);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const out = result.output.?;
 
@@ -2545,7 +2895,7 @@ test "forwards multiple parameters positionally in the logic file's call-through
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "func natyvBuildFoo(parent widgets.Container, extra int) error {") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.logic, "return natyvBuildFoo(parent, extra)") != null);
@@ -2563,7 +2913,7 @@ test "rejects a void composer with a clear error" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "must have signature") != null);
 }
@@ -2580,7 +2930,7 @@ test "rejects an unsupported widget kind with a clear error" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "Slider") != null);
 }
@@ -2597,7 +2947,7 @@ test "ref={&x} assigns the created widget's address to the named package-level v
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.CreateTextField(TextField0Layout, \"Your name\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "nameField = &TextField0") != null);
@@ -2618,7 +2968,7 @@ test "onClick={handler} binds the real .OnClick(...) method, and onClick reads a
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateButton(Button2Layout, \"Save\")") != null);
@@ -2640,7 +2990,7 @@ test ".ntx LSP position-mapping spike: onClick={handleSave} round-trips between 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -2715,7 +3065,7 @@ test ".ntx LSP Stage 4: ref={&x} round-trips between the real .ntx source and th
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -2740,7 +3090,7 @@ test ".ntx LSP Stage 4: styles={token} round-trips between the real .ntx source 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -2764,7 +3114,7 @@ test ".ntx LSP Stage 4: a plain string attribute (TextField placeholder) round-t
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -2788,7 +3138,7 @@ test ".ntx LSP Stage 4: a Button's own child text round-trips" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -2817,7 +3167,7 @@ test ".ntx LSP Stage 4: a component-tag call site round-trips" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -2853,7 +3203,7 @@ test ".ntx LSP Stage 4 follow-up: a string-literal component-call argument round
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -2884,7 +3234,7 @@ test ".ntx LSP Stage 4 follow-up: a nested child's own mapping round-trips throu
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -2932,7 +3282,7 @@ test ".ntx LSP Stage 3: every tag name gets a real .type semantic token, at both
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -2972,7 +3322,7 @@ test ".ntx LSP Stage 3: a self-closing tag gets exactly one .type token, not a p
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -2998,7 +3348,7 @@ test ".ntx LSP Stage 3: every attribute name gets a real .property semantic toke
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -3025,7 +3375,7 @@ test ".ntx LSP Stage 3: style-token names get real .string semantic tokens, but 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
@@ -3059,7 +3409,7 @@ test "rejects an unrecognized attribute with a clear error, translated to an abs
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "bogus") != null);
     try std.testing.expectEqual(@as(u32, 4), result.err.?.line);
@@ -3077,7 +3427,7 @@ test "rejects <Container> with text content" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.output == null);
 }
 
@@ -3098,7 +3448,7 @@ test "multiple composers each get their own generated function and splice" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const out = result.output.?;
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "func natyvBuildNavBar") != null);
@@ -3120,7 +3470,7 @@ test "styles naming a token with margin inserts a wrapper Container, transparent
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "Margin0Layout := widgets.ParentID(uint32(parent))") != null);
@@ -3144,7 +3494,7 @@ test "a token with no margin never inserts a wrapper" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateContainer") == null);
@@ -3172,7 +3522,7 @@ test "styles naming a token overrides direction, childGap, width, and alignment 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     // Direction overridden from the Container tag's own TopToBottom default.
@@ -3208,7 +3558,7 @@ test "styles naming a token overrides a Container's own hardcoded padding" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.Padding = widgets.Padding{Left: 0, Right: 0, Top: 0, Bottom: 0}") != null);
@@ -3230,7 +3580,7 @@ test "styles naming a token overrides a leaf widget's own hardcoded fixed size" 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     // Width overridden from Button's own hardcoded 120; Height (32) is
@@ -3250,7 +3600,7 @@ test "an unknown style name contributes no margin and causes no error" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.CreateContainer") == null);
 }
@@ -3271,7 +3621,7 @@ test "later-wins margin resolution across multiple style names, matching ApplySt
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "Margin0Layout.Padding = widgets.Padding{Left: 20, Right: 20, Top: 20, Bottom: 20}") != null);
 }
@@ -3294,7 +3644,7 @@ test "nested margins produce a two-level wrapper chain, and ref still binds the 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     // Outer wrapper attaches to the composer's own parent param.
@@ -3327,7 +3677,7 @@ test "a bare tag matching a same-file exposed composer compiles to a direct comp
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "func natyvBuildHeader(parent uint32) error {") != null);
@@ -3351,7 +3701,7 @@ test "a bare tag resolved via 'uses' compiles to a qualified cross-package compo
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
     try std.testing.expect(found.err == null);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "import (\n\t\"github.com/natyv-io/sdks/go/widgets\"\n\t\"natyv/ntx-components-guest/components\"\n)\n") != null);
@@ -3383,7 +3733,7 @@ test "two 'uses'-bound tags sharing one path only add that import once" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     var count: usize = 0;
@@ -3413,7 +3763,7 @@ test "a component tag not referenced by any composer body adds no unused import"
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}, false);
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "import \"github.com/natyv-io/sdks/go/widgets\"\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "components") == null);
@@ -3437,7 +3787,7 @@ test "children of a 'uses'-bound component tag compile to a trailing widgets.Bui
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "if err := components.InfoCard(uint32(parent), func(p0 uint32) error {") != null);
@@ -3462,7 +3812,7 @@ test "ref on a component tag is a clear error, not silently dropped" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}, false);
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "ref") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "component tag") != null);
@@ -3484,7 +3834,7 @@ test "an onXxx-named attribute on a component tag forwards as a plain prop, not 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}, false);
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "if err := components.UserCard(uint32(parent), handleTap); err != nil {\n\t\treturn err\n\t}\n") != null);
 }
@@ -3508,7 +3858,7 @@ test "styles on a component tag only applies its margin-wrapping effect, never f
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, found.uses, found.uses_start, found.uses_end, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, found.uses, found.uses_start, found.uses_end, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "Margin0Layout.Padding = widgets.Padding{Left: 16, Right: 16, Top: 16, Bottom: 16}") != null);
@@ -3534,7 +3884,7 @@ test "a 'uses' name colliding with a built-in widget kind is a clear error" {
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
     try std.testing.expect(found.err == null);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}, false);
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "Container") != null);
 }
@@ -3553,7 +3903,7 @@ test "<children/> compiles to a direct call to the composer's own 'children' par
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateContainer(Container0Layout, false, 0)") != null);
@@ -3572,7 +3922,7 @@ test "<children/> rejects attributes and its own children with a clear error" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found1 = try Expose.findComposers(allocator, src_with_attr);
-    const result1 = try generateGo(allocator, "main", src_with_attr, found1.composers, &.{}, &.{}, 0, 0, .{});
+    const result1 = try generateGo(allocator, "main", src_with_attr, found1.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result1.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result1.err.?.message, "attributes") != null);
 
@@ -3584,7 +3934,7 @@ test "<children/> rejects attributes and its own children with a clear error" {
         \\}
     ;
     const found2 = try Expose.findComposers(allocator, src_with_children);
-    const result2 = try generateGo(allocator, "main", src_with_children, found2.composers, &.{}, &.{}, 0, 0, .{});
+    const result2 = try generateGo(allocator, "main", src_with_children, found2.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result2.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result2.err.?.message, "its own children") != null);
 }
@@ -3605,7 +3955,7 @@ test "a composer body that never references a real widget kind gets no unused 'w
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "import \"github.com/natyv-io/sdks/go/widgets\"\n") != null);
 }
@@ -3622,7 +3972,7 @@ test "a composer body whose signature and body both never mention 'widgets' gets
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets") == null);
@@ -3646,7 +3996,7 @@ test "a component-only composer body needing a 'uses' import but no real widget 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "import \"some/other/pkg\"\n") != null);
@@ -3667,7 +4017,7 @@ test "<Image src=...> with no styles= still applies its texture, background true
     const found = try Expose.findComposers(allocator, src);
     var image_texture_ids: std.StringHashMapUnmanaged(u32) = .{};
     try image_texture_ids.put(allocator, "hero.png", 0);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, image_texture_ids);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, image_texture_ids, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateContainer(Image0Layout, true, 0)") != null);
@@ -3689,7 +4039,7 @@ test "<Image src=...> with styles= merges names, src's texture still applied via
     const found = try Expose.findComposers(allocator, src);
     var image_texture_ids: std.StringHashMapUnmanaged(u32) = .{};
     try image_texture_ids.put(allocator, "hero.png", 2);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, image_texture_ids);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, image_texture_ids, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyleToLayoutWithTexture(&Image0Layout, StyleTokens, 2, \"card\")") != null);
@@ -3707,7 +4057,7 @@ test "<Image> requires a src attribute" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err != null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "src") != null);
 }
@@ -3726,7 +4076,7 @@ test "<Image> rejects children" {
     const found = try Expose.findComposers(allocator, src);
     var image_texture_ids: std.StringHashMapUnmanaged(u32) = .{};
     try image_texture_ids.put(allocator, "hero.png", 0);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, image_texture_ids);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, image_texture_ids, false);
     try std.testing.expect(result.err != null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "children") != null);
 }
@@ -3743,7 +4093,7 @@ test "<Image src=...> naming a path never staged is a clear error, not a crash" 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err != null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "never-staged.png") != null);
 }
@@ -3760,7 +4110,7 @@ test "text={expr} on Label emits the raw expression unquoted, not a Go string li
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateLabel(Label0Layout, msg.From)") != null);
@@ -3781,7 +4131,7 @@ test "text=\"literal\" on Button emits a quoted Go string literal, same as liter
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateButton(Button0Layout, \"Save\")") != null);
@@ -3799,7 +4149,7 @@ test "text={expr} together with literal child text is a clear error, not silentl
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err != null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "text") != null);
 }
@@ -3816,7 +4166,7 @@ test "text={expr} records a real .dynamic_text SourceMapping at the expression's
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     const output = result.output.?;
     var found_mapping = false;
     for (output.source_map) |m| {
@@ -3846,7 +4196,7 @@ test "<%...%> emits real code verbatim with a built-in widget's real call splice
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     // The real loop header/footer, pasted verbatim, not re-synthesized.
@@ -3878,7 +4228,7 @@ test "<%...%> can call another exposed composer from the same file inline" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "for _, msg := range messages {") != null);
@@ -3907,7 +4257,7 @@ test "<%...%> can call a 'uses'-imported component inline, and its import gets a
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "pkg.MessageRow(uint32(Container0), msg.From)") != null);
@@ -3929,7 +4279,7 @@ test "<%...%> an unregistered tag-shaped name inside raw code round-trips as pla
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "ok := a < NotARealTag(b)") != null);
@@ -3948,7 +4298,7 @@ test "<TextArea> uses text={expr} for real, dynamic initial content" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateTextArea(TextArea0Layout, \"\")") != null);
@@ -3967,7 +4317,7 @@ test "<TextArea>literal placeholder</TextArea> still works as plain child text" 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateTextArea(TextArea0Layout, \"Body\")") != null);
@@ -3975,7 +4325,7 @@ test "<TextArea>literal placeholder</TextArea> still works as plain child text" 
 
 fn testGenerated(allocator: std.mem.Allocator, src: []const u8) !struct { err: ?CodegenError, generated: ?[]const u8 } {
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
     if (result.err) |e| return .{ .err = e, .generated = null };
     return .{ .err = null, .generated = result.output.?.generated };
 }
@@ -4147,7 +4497,7 @@ test "styles={...} naming a token with scroll: vertical emits .ScrollVertical = 
     const found = try Expose.findComposers(allocator, src);
     try std.testing.expect(found.err == null);
     const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "list", .scroll = .vertical }};
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.ScrollVertical = true") != null);
@@ -4170,7 +4520,7 @@ test "styles={...} naming a token with scroll: both emits both axes" {
     const found = try Expose.findComposers(allocator, src);
     try std.testing.expect(found.err == null);
     const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "grid", .scroll = .both }};
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.ScrollVertical = true") != null);
@@ -4289,7 +4639,7 @@ test "<Dialog styles={...}/> targets .ID() -- Dialog returns a plain value, stil
     const src = "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Dialog styles={nav} message=\"Hi\" buttonLabels={labels} />\n}\n";
     const found = try Expose.findComposers(allocator, src);
     const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "nav", .background_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } }};
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyleToLayout(&Dialog0Layout, StyleTokens, \"nav\")") != null);
 }
@@ -4352,7 +4702,7 @@ test "<AccordionSection styles={...}/> shapes the header only, targeting .ID() (
     const src = "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <AccordionSection styles={nav} expanded={true} background={false} />\n}\n";
     const found = try Expose.findComposers(allocator, src);
     const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "nav", .width = .{ .kind = .fixed, .value = 200 } }};
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "AccordionSection0HeaderLayout.Sizing = widgets.Sizing{Width: widgets.Fixed(200)") != null);
@@ -4387,7 +4737,7 @@ test "<Card styles={...}/> targets .ID(), distinct from .ContentID()" {
     const src = "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Card styles={nav}></Card>\n}\n";
     const found = try Expose.findComposers(allocator, src);
     const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "nav", .background_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } }};
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyleToLayout(&Card0Layout, StyleTokens, \"nav\")") != null);
 }
@@ -4433,7 +4783,7 @@ test "<Tooltip styles={...}/> targets .ID()" {
     const src = "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Tooltip styles={nav} width={200} height={60} message=\"Hi\">Hover</Tooltip>\n}\n";
     const found = try Expose.findComposers(allocator, src);
     const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "nav", .background_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } }};
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.ApplyStyleToLayout(&Tooltip0Layout, StyleTokens, \"nav\")") != null);
 }
