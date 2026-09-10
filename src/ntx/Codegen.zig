@@ -1073,15 +1073,24 @@ const Emitter = struct {
     /// call site in `emitElement` -- the 9 struct-backed kinds need their
     /// own extra-`WrapX`-argument handling (tier 1/2/3, a later stage of
     /// this same pass) before this can safely cover them too.
-    fn emitAutoBinding(self: *Emitter, var_name: []const u8, tag: []const u8, attr_name: []const u8, handler_expr: []const u8) EmitError!void {
+    fn emitAutoBinding(self: *Emitter, var_name: []const u8, tag: []const u8, attr_name: []const u8, handler_expr: []const u8, bind_kind_override: ?[]const u8, bind_args_override: ?[]const u8) EmitError!void {
         const id_expr = try std.fmt.allocPrint(self.allocator, "uint32({s})", .{var_name});
-        const kind = try std.fmt.allocPrint(self.allocator, "gen_{s}_{s}_{s}", .{ self.composer_name, var_name, attr_name });
+        const kind = bind_kind_override orelse try std.fmt.allocPrint(self.allocator, "gen_{s}_{s}_{s}", .{ self.composer_name, var_name, attr_name });
+        const args_expr = bind_args_override orelse "nil";
         try self.out.appendSlice(self.allocator, "\tif err := natyv.RegisterBinding(");
         try self.out.appendSlice(self.allocator, id_expr);
         try self.out.appendSlice(self.allocator, ", \"");
         try self.out.appendSlice(self.allocator, kind);
-        try self.out.appendSlice(self.allocator, "\", nil); err != nil {\n\t\treturn err\n\t}\n");
+        try self.out.appendSlice(self.allocator, "\", ");
+        try self.out.appendSlice(self.allocator, args_expr);
+        try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
         self.uses_natyv_root.* = true;
+
+        // bindKind= means the developer has explicitly opted into
+        // hand-writing the reattachment (their own RegisterHandlerFunc +
+        // rebind function) -- codegen must not also try to auto-generate
+        // one, regardless of what the handler expression looks like.
+        if (bind_kind_override != null) return;
 
         if (isBareIdentifierExpr(handler_expr) and isSafeToResplice(handler_expr, self.composer_params, self.composer_raw_code_locals)) {
             try self.pending_rebinds.append(self.allocator, .{
@@ -2513,8 +2522,46 @@ const Emitter = struct {
         try self.out.appendSlice(self.allocator, var_name);
         try self.out.appendSlice(self.allocator, "\n");
 
+        // Part 2 (codegen automation) escape hatch: bindKind=/bindArgs=
+        // are new syntax, meaningful only when recycle_enabled -- when it's
+        // false, both names deliberately fall through to the ordinary
+        // "attribute isn't supported yet" error below, exactly as any
+        // unrecognized name already did before this feature existed
+        // (byte-identical *behavior*, not just byte-identical output, for
+        // an app that hasn't opted in). Pre-scanned once per element --
+        // markup attribute order isn't guaranteed to put them before the
+        // event attribute they apply to -- validated for shape here, then
+        // consumed by the isEventAttr branch below rather than being
+        // independently "emitted." Neither attribute needs a ref= or a
+        // struct-backed-ness check of its own: the id-expression
+        // emitAutoBinding needs doesn't depend on either.
+        var bind_kind_override: ?[]const u8 = null;
+        var bind_args_override: ?[]const u8 = null;
+        if (self.recycle_enabled) {
+            for (el.attrs) |attr| {
+                if (std.mem.eql(u8, attr.name, "bindKind")) {
+                    bind_kind_override = switch (attr.value) {
+                        .string_literal => |s| s,
+                        else => return self.fail(attr.line, attr.col, "bindKind must be a plain string literal, e.g. bindKind=\"myKind\"", .{}),
+                    };
+                } else if (std.mem.eql(u8, attr.name, "bindArgs")) {
+                    bind_args_override = switch (attr.value) {
+                        .expr => |ex| ex.expr,
+                        else => return self.fail(attr.line, attr.col, "bindArgs must be a real expression, e.g. bindArgs={{someExpr}}", .{}),
+                    };
+                }
+            }
+            if (bind_args_override != null and bind_kind_override == null) {
+                return self.fail(el.line, el.col, "'{s}' has bindArgs= but no bindKind= -- bindArgs= only makes sense alongside an explicit bindKind=", .{el.tag});
+            }
+        }
+        var bind_kind_consumed = false;
+
         for (el.attrs) |attr| {
             if (isSkippedAttr(attr.name, skip_attrs)) continue;
+            if (self.recycle_enabled and (std.mem.eql(u8, attr.name, "bindKind") or std.mem.eql(u8, attr.name, "bindArgs"))) {
+                continue; // consumed by the pre-scan above and the event-attr branch below
+            }
             if (std.mem.eql(u8, attr.name, "styles")) {
                 switch (attr.value) {
                     // 2026-09-10: the real, non-dynamic case is already
@@ -2565,7 +2612,8 @@ const Emitter = struct {
                         // handling (a later stage of this same pass)
                         // before this can safely cover them too.
                         if (self.recycle_enabled and !isStructBackedWidgetKind(el.tag)) {
-                            try self.emitAutoBinding(var_name, el.tag, attr.name, ex.expr);
+                            bind_kind_consumed = bind_kind_override != null;
+                            try self.emitAutoBinding(var_name, el.tag, attr.name, ex.expr, bind_kind_override, bind_args_override);
                         }
                     },
                     else => return self.fail(attr.line, attr.col, "'{s}' must be a real handler expression, e.g. {s}={{handleX}}", .{ attr.name, attr.name }),
@@ -2573,6 +2621,9 @@ const Emitter = struct {
             } else {
                 return self.fail(attr.line, attr.col, "attribute '{s}' isn't supported yet", .{attr.name});
             }
+        }
+        if (bind_kind_override != null and !bind_kind_consumed) {
+            return self.fail(el.line, el.col, "'{s}' has bindKind= but no event-handler attribute (e.g. onClick=) on the same tag -- bindKind=/bindArgs= only make sense alongside a real handler attribute", .{el.tag});
         }
         // 2026-09-10: <Image>'s own branch above now unconditionally emits
         // its atomic emitApplyStyleToLayoutWithTexture call (styles={} or
@@ -3064,6 +3115,153 @@ test "recycle_enabled: a struct-backed kind (Dropdown) gets no auto-binding yet,
     try std.testing.expect(std.mem.indexOf(u8, gen, "RegisterBinding") == null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateDropdown") != null);
+}
+
+test "bindKind=/bindArgs=: a composer-param handler gets RegisterBinding with the override kind/args, no auto rebind function" {
+    const src =
+        \\package main
+        \\
+        \\expose FolderView
+        \\
+        \\func FolderView(parent widgets.Container, onOlder func() error, folder string) error {
+        \\  <Button onClick={onOlder} bindKind="pagerNav" bindArgs={pagerArgs{Folder: folder, Delta: 1}}>Older</Button>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "if err := natyv.RegisterBinding(uint32(Button0), \"pagerNav\", pagerArgs{Folder: folder, Delta: 1}); err != nil {\n\t\treturn err\n\t}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func init()") == null);
+}
+
+test "bindKind= alone (no bindArgs=) defaults args to nil" {
+    const src =
+        \\package main
+        \\
+        \\expose ComposeView
+        \\
+        \\func ComposeView(parent widgets.Container, onSend func() error) error {
+        \\  <Button onClick={onSend} bindKind="composeSend">Send</Button>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "natyv.RegisterBinding(uint32(Button0), \"composeSend\", nil)") != null);
+}
+
+test "bindArgs= with no bindKind= on the same tag is a clear codegen error" {
+    const src =
+        \\package main
+        \\
+        \\expose FolderView
+        \\
+        \\func FolderView(parent widgets.Container, onOlder func() error) error {
+        \\  <Button onClick={onOlder} bindArgs={nil}>Older</Button>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "bindArgs=") != null);
+}
+
+test "bindKind= with no event-handler attribute on the same tag is a clear codegen error" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <Button bindKind="orphan">Save</Button>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "bindKind=") != null);
+}
+
+test "bindKind=/bindArgs= are unrecognized attributes when recycle_enabled is false, same as before this feature existed" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <Button onClick={handleSave} bindKind="x">Save</Button>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
+    try std.testing.expect(result.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "isn't supported yet") != null);
+}
+
+test "bindArgs= still works when its expression references a raw-code block's surrounding scope" {
+    // Real shape from mail-natyv's own MessageRow: the Checkbox tag sits
+    // inside a <%...%> raw-code block, which disqualifies auto-generating
+    // a rebind function for its handler (the block may declare locals
+    // codegen can't safely tell apart from package functions) -- but
+    // bindArgs='s own scope constraint is identical to onClick='s (both
+    // are spliced into the same generated function body), and has nothing
+    // to do with whether the *tag* happens to sit inside <%...%>.
+    const src =
+        \\package main
+        \\
+        \\expose MessageRow
+        \\
+        \\func MessageRow(parent uint32, seq int, onSelect func(seq int, checked bool) error) error {
+        \\  <Container>
+        \\    <%
+        \\      var checkbox *widgets.Checkbox
+        \\      <Checkbox ref={&checkbox} onClick={handleCheckboxClick} bindKind="rowCheckbox" bindArgs={rowArgs{Seq: seq}} />
+        \\    %>
+        \\  </Container>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "natyv.RegisterBinding(uint32(Checkbox1), \"rowCheckbox\", rowArgs{Seq: seq})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
 }
 
 test "generates a builder function and a spliced logic file for a single flat composer" {
