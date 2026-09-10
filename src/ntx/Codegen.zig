@@ -1046,6 +1046,53 @@ const Emitter = struct {
         try self.out.appendSlice(self.allocator, ")\n");
     }
 
+    /// True only when `expr` is, in its entirety, a single bare
+    /// identifier -- no dots, no calls, no closure literal. Re-splicing a
+    /// qualified selector (`somepkg.Handler`) into the generated file
+    /// would fail to compile, since the generated file's own import block
+    /// is independently computed from `used_paths`/`widgets`/`natyv` only,
+    /// never from whatever the hand-written logic file happens to import.
+    fn isBareIdentifierExpr(expr: []const u8) bool {
+        const ident = leadingIdent(expr) orelse return false;
+        return ident.len == expr.len;
+    }
+
+    /// Part 2 (codegen automation): always emits the
+    /// `natyv.RegisterBinding(<id-expr>, "<kind>", <args-expr>)` call for
+    /// an event-attributed widget -- mechanical regardless of whether the
+    /// handler is a bare function, a composer-param closure, or a closure
+    /// literal, since it only needs the widget's own id-expression and a
+    /// kind/args pair (auto-derived here; `bindKind=`/`bindArgs=`, when
+    /// present, override both -- see `emitElement`'s own handling of
+    /// those two attributes). Separately classifies whether a full rebind
+    /// function can *also* be auto-generated (`isSafeToResplice`, bare
+    /// identifier only) and, if so, queues a `PendingRebind` -- consumed
+    /// once, at the end of `generateGo`, to actually emit it.
+    ///
+    /// Scoped, for now, to non-struct-backed kinds only by its own single
+    /// call site in `emitElement` -- the 9 struct-backed kinds need their
+    /// own extra-`WrapX`-argument handling (tier 1/2/3, a later stage of
+    /// this same pass) before this can safely cover them too.
+    fn emitAutoBinding(self: *Emitter, var_name: []const u8, tag: []const u8, attr_name: []const u8, handler_expr: []const u8) EmitError!void {
+        const id_expr = try std.fmt.allocPrint(self.allocator, "uint32({s})", .{var_name});
+        const kind = try std.fmt.allocPrint(self.allocator, "gen_{s}_{s}_{s}", .{ self.composer_name, var_name, attr_name });
+        try self.out.appendSlice(self.allocator, "\tif err := natyv.RegisterBinding(");
+        try self.out.appendSlice(self.allocator, id_expr);
+        try self.out.appendSlice(self.allocator, ", \"");
+        try self.out.appendSlice(self.allocator, kind);
+        try self.out.appendSlice(self.allocator, "\", nil); err != nil {\n\t\treturn err\n\t}\n");
+        self.uses_natyv_root.* = true;
+
+        if (isBareIdentifierExpr(handler_expr) and isSafeToResplice(handler_expr, self.composer_params, self.composer_raw_code_locals)) {
+            try self.pending_rebinds.append(self.allocator, .{
+                .kind = kind,
+                .widget_tag = tag,
+                .attr_name = attr_name,
+                .handler_name = handler_expr,
+            });
+        }
+    }
+
     /// Sensible per-tag layout defaults, applied unconditionally until a
     /// real sizing/layout attribute grammar is designed (not yet -- no
     /// `.ntx` example anywhere authors explicit sizing/padding/direction
@@ -2510,7 +2557,17 @@ const Emitter = struct {
                     // Same Stage 5 fix as `ref` above: `ex.line`/`ex.col`
                     // mark `handleSave`'s own position in
                     // `onClick={handleSave}`, not `onClick`'s.
-                    .expr => |ex| try self.emitEventBinding(var_name, attr.name, ex.expr, ex.line, ex.col),
+                    .expr => |ex| {
+                        try self.emitEventBinding(var_name, attr.name, ex.expr, ex.line, ex.col);
+                        // Part 2 (codegen automation): scoped for now to
+                        // non-struct-backed kinds only -- the 9 struct-
+                        // backed kinds need their own extra-WrapX-argument
+                        // handling (a later stage of this same pass)
+                        // before this can safely cover them too.
+                        if (self.recycle_enabled and !isStructBackedWidgetKind(el.tag)) {
+                            try self.emitAutoBinding(var_name, el.tag, attr.name, ex.expr);
+                        }
+                    },
                     else => return self.fail(attr.line, attr.col, "'{s}' must be a real handler expression, e.g. {s}={{handleX}}", .{ attr.name, attr.name }),
                 }
             } else {
@@ -2783,6 +2840,42 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
         try edits.append(allocator, .{ .start = composer.body_start, .end = composer.body_end, .replacement = call_through });
     }
 
+    // Part 2 (codegen automation): one rebind function per
+    // `pending_rebinds` entry (queued by `emitAutoBinding`'s own "safe
+    // auto" classification), plus one `init()` registering all of them.
+    // Appended directly to `body`, same as every composer's own emitted
+    // function -- `Wrap<Tag>`/`On<X>` are derived the same mechanical way
+    // the create/event-binding emission above already derives
+    // `CreateX`/`.OnX` from a tag/attr name, no new naming logic.
+    if (pending_rebinds.items.len > 0) {
+        for (pending_rebinds.items) |pr| {
+            try body.appendSlice(allocator, "\nfunc rebind_");
+            try body.appendSlice(allocator, pr.kind);
+            try body.appendSlice(allocator, "(widgetID uint32, args json.RawMessage) error {\n\t_ = args\n\twidgets.Wrap");
+            try body.appendSlice(allocator, pr.widget_tag);
+            try body.appendSlice(allocator, "(widgetID");
+            for (pr.extra_wrap_args) |arg| {
+                try body.appendSlice(allocator, ", ");
+                try body.appendSlice(allocator, arg);
+            }
+            try body.appendSlice(allocator, ").On");
+            try body.append(allocator, pr.attr_name[2]);
+            try body.appendSlice(allocator, pr.attr_name[3..]);
+            try body.appendSlice(allocator, "(");
+            try body.appendSlice(allocator, pr.handler_name);
+            try body.appendSlice(allocator, ")\n\treturn nil\n}\n");
+        }
+        try body.appendSlice(allocator, "\nfunc init() {\n");
+        for (pending_rebinds.items) |pr| {
+            try body.appendSlice(allocator, "\tnatyv.RegisterHandlerFunc(\"");
+            try body.appendSlice(allocator, pr.kind);
+            try body.appendSlice(allocator, "\", rebind_");
+            try body.appendSlice(allocator, pr.kind);
+            try body.appendSlice(allocator, ")\n");
+        }
+        try body.appendSlice(allocator, "}\n");
+    }
+
     const logic = try applyEdits(allocator, src, edits.items);
 
     var generated: std.ArrayList(u8) = .empty;
@@ -2814,6 +2907,18 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
 
     var all_imports: std.ArrayList([]const u8) = .empty;
     if (uses_widgets) try all_imports.append(allocator, "github.com/natyv-io/sdks/go/widgets");
+    // Part 2 (codegen automation): mirrors the precise `used_paths`
+    // pattern, not the fragile `widgets.`-substring-scan approach above --
+    // `uses_natyv_root` flips true the instant `emitAutoBinding` actually
+    // emits a real `natyv.RegisterBinding` call, so this is never wrong in
+    // either direction the way a second substring scan for `"natyv."`
+    // could be (e.g. a Label's own literal text coincidentally containing
+    // it). `encoding/json` is needed only when a rebind function was
+    // actually emitted (its signature must match
+    // `natyv.RegisterHandlerFunc`'s own `func(uint32, json.RawMessage)
+    // error` callback type exactly).
+    if (uses_natyv_root) try all_imports.append(allocator, "github.com/natyv-io/sdks/go");
+    if (pending_rebinds.items.len > 0) try all_imports.append(allocator, "encoding/json");
     try all_imports.appendSlice(allocator, used_paths.items);
 
     if (all_imports.items.len == 1) {
@@ -2846,6 +2951,119 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
     }
 
     return .{ .output = .{ .generated = try generated.toOwnedSlice(allocator), .logic = logic, .source_map = try mappings.toOwnedSlice(allocator), .semantic_tokens = try semantic_tokens.toOwnedSlice(allocator), .edits = try edits.toOwnedSlice(allocator) }, .err = null };
+}
+
+test "recycle_enabled: a bare-function onClick auto-generates RegisterBinding, a rebind function, and init()" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <Button onClick={handleSave}>Save</Button>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "\"github.com/natyv-io/sdks/go\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "\"encoding/json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "if err := natyv.RegisterBinding(uint32(Button0), \"gen_Toolbar_Button0_onClick\", nil); err != nil {\n\t\treturn err\n\t}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_gen_Toolbar_Button0_onClick(widgetID uint32, args json.RawMessage) error {\n\t_ = args\n\twidgets.WrapButton(widgetID).OnClick(handleSave)\n\treturn nil\n}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func init() {\n\tnatyv.RegisterHandlerFunc(\"gen_Toolbar_Button0_onClick\", rebind_gen_Toolbar_Button0_onClick)\n}") != null);
+}
+
+test "recycle_enabled: false produces byte-identical output to before this feature existed" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <Button onClick={handleSave}>Save</Button>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    const with_recycle_off = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
+    const gen = with_recycle_off.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "RegisterBinding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "\"github.com/natyv-io/sdks/go\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "encoding/json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func init()") == null);
+}
+
+test "recycle_enabled: a composer-param handler still gets RegisterBinding but no rebind function" {
+    // onOlder is FolderView's own parameter -- its real value is a closure
+    // built by the caller, closing over state (e.g. folder) this composer
+    // never sees. RegisterBinding is still safe to auto-emit (it only
+    // needs the widget's own id-expression); a full rebind function is
+    // not, since codegen can't know what real handler this represents
+    // from inside the composer alone.
+    const src =
+        \\package main
+        \\
+        \\expose FolderView
+        \\
+        \\func FolderView(parent widgets.Container, onOlder func() error) error {
+        \\  <Button onClick={onOlder}>Older</Button>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "if err := natyv.RegisterBinding(uint32(Button0), \"gen_FolderView_Button0_onClick\", nil); err != nil {\n\t\treturn err\n\t}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func init()") == null);
+}
+
+test "recycle_enabled: a struct-backed kind (Dropdown) gets no auto-binding yet, and still compiles-shaped" {
+    // Scoped out entirely by this stage -- struct-backed kinds need their
+    // own extra-WrapX-argument handling (a later stage of this same pass)
+    // before RegisterBinding/rebind generation can safely cover them.
+    // Real regression this guards: a plain WrapDropdown(widgetID) call
+    // (the non-struct-backed template) would be a genuine "not enough
+    // arguments" compile error against the real SDK signature.
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <Dropdown options={opts} onSelect={handleSelect} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "RegisterBinding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateDropdown") != null);
 }
 
 test "generates a builder function and a spliced logic file for a single flat composer" {
