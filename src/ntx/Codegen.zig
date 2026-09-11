@@ -1085,8 +1085,18 @@ const Emitter = struct {
     /// call site in `emitElement` -- the 9 struct-backed kinds need their
     /// own extra-`WrapX`-argument handling (tier 1/2/3, a later stage of
     /// this same pass) before this can safely cover them too.
-    fn emitAutoBinding(self: *Emitter, var_name: []const u8, tag: []const u8, attr_name: []const u8, handler_expr: []const u8, bind_kind_override: ?[]const u8, bind_args_override: ?[]const u8) EmitError!void {
-        const id_expr = try std.fmt.allocPrint(self.allocator, "uint32({s})", .{var_name});
+    /// `id_expr` is the caller's own already-resolved id-expression
+    /// (`var_name.ID()` for a struct-backed kind, `uint32(var_name)`
+    /// otherwise -- the exact same precedent `ApplyStyle`'s own call site
+    /// already established). `rebind_extra_args` decides whether a full
+    /// rebind function is even attempted at all: `null` means don't try
+    /// (tier-2/3 struct-backed kinds, not supported yet -- RegisterBinding
+    /// still fires regardless, since that part is always safe); a real
+    /// (possibly empty) slice means try, splicing each entry as an extra
+    /// `WrapX` argument after the widget id (empty for every non-struct-
+    /// backed kind; one entry for a tier-1 kind's own extra creation-time
+    /// attribute, e.g. Dropdown's `options=`).
+    fn emitAutoBinding(self: *Emitter, var_name: []const u8, tag: []const u8, attr_name: []const u8, handler_expr: []const u8, id_expr: []const u8, bind_kind_override: ?[]const u8, bind_args_override: ?[]const u8, rebind_extra_args: ?[]const []const u8) EmitError!void {
         const kind = bind_kind_override orelse try std.fmt.allocPrint(self.allocator, "gen_{s}_{s}_{s}", .{ self.composer_name, var_name, attr_name });
         const args_expr = bind_args_override orelse "nil";
         try self.out.appendSlice(self.allocator, "\tif err := natyv.RegisterBinding(");
@@ -1103,6 +1113,7 @@ const Emitter = struct {
         // rebind function) -- codegen must not also try to auto-generate
         // one, regardless of what the handler expression looks like.
         if (bind_kind_override != null) return;
+        const extra_args = rebind_extra_args orelse return;
 
         if (isBareIdentifierExpr(handler_expr) and isSafeToResplice(handler_expr, self.composer_params, self.composer_raw_code_locals)) {
             try self.pending_rebinds.append(self.allocator, .{
@@ -1110,8 +1121,36 @@ const Emitter = struct {
                 .widget_tag = tag,
                 .attr_name = attr_name,
                 .handler_name = handler_expr,
+                .extra_wrap_args = extra_args,
             });
         }
+    }
+
+    /// Part 2 (codegen automation), tier-1 struct-backed resplice (§3.5):
+    /// `null` for any kind that isn't one of the three tier-1 kinds, or
+    /// whose own extra creation-time attribute expression isn't safe to
+    /// resplice (falls through to requiring the `bindKind=`/`bindArgs=`
+    /// escape hatch, same as any other "can't auto-generate" case) --
+    /// otherwise a one-entry slice with that attribute's raw expression
+    /// text, re-spliced verbatim into the rebind function exactly as
+    /// originally written (the *same already-parsed* expression the
+    /// widget's own `CreateX` call above already emitted, not a second
+    /// parse). Tier-2/3 kinds (MenuBar/Dialog/Breadcrumbs/DateTimePicker/
+    /// Table/Tree) aren't handled here at all -- they need real SDK
+    /// accessor methods that don't exist yet (a later stage of this pass).
+    fn tier1ExtraWrapArgs(self: *Emitter, el: Parser.Element) EmitError!?[]const []const u8 {
+        const attr_name = if (std.mem.eql(u8, el.tag, "Dropdown") or std.mem.eql(u8, el.tag, "Combobox"))
+            "options"
+        else if (std.mem.eql(u8, el.tag, "Menu"))
+            "items"
+        else
+            return null;
+
+        const found = (try self.exprAttr(el, attr_name)) orelse return null;
+        if (!isSafeToResplice(found.expr, self.composer_params, self.composer_raw_code_locals)) return null;
+        const args = try self.allocator.alloc([]const u8, 1);
+        args[0] = found.expr;
+        return args;
     }
 
     /// Sensible per-tag layout defaults, applied unconditionally until a
@@ -2641,14 +2680,30 @@ const Emitter = struct {
                     // `onClick={handleSave}`, not `onClick`'s.
                     .expr => |ex| {
                         try self.emitEventBinding(var_name, attr.name, ex.expr, ex.line, ex.col);
-                        // Part 2 (codegen automation): scoped for now to
-                        // non-struct-backed kinds only -- the 9 struct-
-                        // backed kinds need their own extra-WrapX-argument
-                        // handling (a later stage of this same pass)
-                        // before this can safely cover them too.
-                        if (self.recycle_enabled and !isStructBackedWidgetKind(el.tag)) {
+                        // Part 2 (codegen automation): RegisterBinding is
+                        // always mechanical regardless of struct-backed-
+                        // ness, so it fires for every kind. A full rebind
+                        // function is a separate decision -- non-struct-
+                        // backed kinds always attempt one (zero extra
+                        // args); tier-1 struct-backed kinds (Dropdown/
+                        // Combobox/Menu) attempt one with their own extra
+                        // WrapX argument when it's safe to resplice; every
+                        // other struct-backed kind (tier 2/3) isn't
+                        // attempted at all yet -- their own extra-WrapX-
+                        // argument handling needs real SDK accessor
+                        // methods that don't exist yet (a later stage of
+                        // this same pass).
+                        if (self.recycle_enabled) {
                             bind_kind_consumed = bind_kind_override != null;
-                            try self.emitAutoBinding(var_name, el.tag, attr.name, ex.expr, bind_kind_override, bind_args_override);
+                            const id_expr = if (isStructBackedWidgetKind(el.tag))
+                                try std.fmt.allocPrint(self.allocator, "{s}.ID()", .{var_name})
+                            else
+                                try std.fmt.allocPrint(self.allocator, "uint32({s})", .{var_name});
+                            const rebind_extra_args: ?[]const []const u8 = if (isStructBackedWidgetKind(el.tag))
+                                try self.tier1ExtraWrapArgs(el)
+                            else
+                                &.{};
+                            try self.emitAutoBinding(var_name, el.tag, attr.name, ex.expr, id_expr, bind_kind_override, bind_args_override, rebind_extra_args);
                         }
                     },
                     else => return self.fail(attr.line, attr.col, "'{s}' must be a real handler expression, e.g. {s}={{handleX}}", .{ attr.name, attr.name }),
@@ -3129,13 +3184,7 @@ test "recycle_enabled: a composer-param handler still gets RegisterBinding but n
     try std.testing.expect(std.mem.indexOf(u8, gen, "func init()") == null);
 }
 
-test "recycle_enabled: a struct-backed kind (Dropdown) gets no auto-binding yet, and still compiles-shaped" {
-    // Scoped out entirely by this stage -- struct-backed kinds need their
-    // own extra-WrapX-argument handling (a later stage of this same pass)
-    // before RegisterBinding/rebind generation can safely cover them.
-    // Real regression this guards: a plain WrapDropdown(widgetID) call
-    // (the non-struct-backed template) would be a genuine "not enough
-    // arguments" compile error against the real SDK signature.
+test "tier 1: Dropdown with a plain named onSelect handler auto-generates a full rebind function with its options= re-spliced" {
     const src =
         \\package main
         \\
@@ -3155,9 +3204,90 @@ test "recycle_enabled: a struct-backed kind (Dropdown) gets no auto-binding yet,
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
 
-    try std.testing.expect(std.mem.indexOf(u8, gen, "RegisterBinding") == null);
-    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
+    // Struct-backed id-expression (Dropdown0.ID(), not uint32(Dropdown0))
+    // -- the same precedent ApplyStyle's own call site already uses.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "if err := natyv.RegisterBinding(Dropdown0.ID(), \"gen_Toolbar_Dropdown0_onSelect\", nil); err != nil {\n\t\treturn err\n\t}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_gen_Toolbar_Dropdown0_onSelect(widgetID uint32, args json.RawMessage) error {\n\t_ = args\n\twidgets.WrapDropdown(widgetID, opts).OnSelect(handleSelect)\n\treturn nil\n}") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateDropdown") != null);
+}
+
+test "tier 1: Menu re-splices its items= (not options=), Combobox re-splices options= same as Dropdown" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <Menu items={menuItems} onSelect={handleMenuSelect}>Open</Menu>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.WrapMenu(widgetID, menuItems).OnSelect(handleMenuSelect)") != null);
+}
+
+test "tier 1: an unsafe options= expression (references a composer param) still gets RegisterBinding but no rebind function" {
+    const src =
+        \\package main
+        \\
+        \\expose FolderView
+        \\
+        \\func FolderView(parent widgets.Container, pageSizeOptions []string) error {
+        \\  <Dropdown options={pageSizeOptions} onSelect={handleSelect} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "RegisterBinding(Dropdown0.ID()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
+}
+
+test "tier 2/3: a struct-backed kind with no accessor support yet (MenuBar) still gets RegisterBinding, but no rebind function" {
+    // Real regression this guards: a plain WrapMenuBar(widgetID) call --
+    // the tier-1 template applied to a kind that actually needs an
+    // ordered trigger-id list too -- would be a genuine "not enough
+    // arguments" compile error against the real SDK signature. Confirms
+    // RegisterBinding (always mechanical, lifted for every kind this
+    // stage) doesn't accidentally also unlock rebind generation for a
+    // kind whose real WrapX extra-argument handling doesn't exist yet.
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <MenuBar entries={entries} itemWidth={80} itemHeight={32} onSelect={handleMenuBarSelect} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "RegisterBinding(MenuBar0.ID()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateMenuBar") != null);
 }
 
 test "bindKind=/bindArgs=: a composer-param handler gets RegisterBinding with the override kind/args, no auto rebind function" {
