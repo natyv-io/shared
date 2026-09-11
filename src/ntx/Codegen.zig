@@ -182,10 +182,24 @@ pub const PendingRebind = struct {
     widget_tag: []const u8,
     attr_name: []const u8,
     handler_name: []const u8,
-    /// Raw expression text for a tier-1 struct-backed kind's extra `WrapX`
-    /// argument (e.g. Dropdown's `options=`), re-spliced verbatim into the
-    /// rebind function -- empty for every non-struct-backed kind.
+    /// Raw expression text for a struct-backed kind's extra `WrapX`
+    /// argument(s) -- tier-1's own creation-time attribute re-spliced
+    /// verbatim (e.g. Dropdown's `options=`), or, for tier 2/3, the
+    /// already-restored package-level var(s) holding whatever the
+    /// accessor method returned at the *last checkpoint* (never a live
+    /// call to the accessor itself -- see `tier23ExtraWrapArgs`'s own doc
+    /// comment for why calling the accessor here would be a real, live
+    /// nil-pointer crash) followed by any of *its own* extra creation-time
+    /// attributes (e.g. MenuBar's `entries=`), also re-spliced verbatim.
+    /// Empty for every non-struct-backed kind.
     extra_wrap_args: []const []const u8 = &.{},
+    /// True only for a kind whose `WrapX` returns `(T, error)` instead of
+    /// a bare `T` -- today just Table/Tree (every other `WrapX` in this
+    /// SDK, tier-1 struct-backed kinds included, returns a bare value).
+    /// Changes the rebind function's own shape: `w, err :=
+    /// widgets.WrapX(...); if err != nil { return err }; w.OnX(...)`
+    /// instead of the usual single-statement chained call.
+    wrap_returns_error: bool = false,
 };
 
 /// One package-level `ref={&x}` target qualifying for Mechanism 1's
@@ -207,11 +221,31 @@ pub const RefPersistEntry = struct {
 /// based reattachment mechanism -- see `Output.struct_backed_snapshot_entries`.
 pub const StructBackedSnapshotEntry = struct {
     widget_kind: []const u8,
+    /// Always a `*widgets.<widget_kind>` package-level variable name --
+    /// every `ref=` target is a pointer at the target side regardless of
+    /// whether the kind's own `CreateX` returns a pointer or a value (see
+    /// `emitRefAssign`'s own `already_pointer` doc comment; confirmed
+    /// against the real `<Breadcrumbs ref={&x}/>` test, where `x` is
+    /// `*widgets.Breadcrumbs` despite `CreateBreadcrumbs` itself returning
+    /// a plain value) -- so `natyv_generated.go`'s own snapshot code can
+    /// always guard with a uniform `if target_name != nil { ... }`, no
+    /// widget-kind-specific branching needed.
     target_name: []const u8,
     /// The new SDK accessor method's name (e.g. "TriggerIDs", "Snapshot")
     /// -- `natyv_generated.go`'s own aggregation calls this on the
     /// dereferenced ref'd handle.
     accessor_method: []const u8,
+    /// True when `target_name` was auto-synthesized (no real `ref=` on
+    /// this tag) -- `natyv_generated.go`'s own package-level `var
+    /// target_name *widgets.widget_kind` declaration then belongs in
+    /// *this* file's own generated output (right alongside the rebind
+    /// function that needs it), not there, since a synthesized name has
+    /// nowhere else it could have been declared. False for a real,
+    /// developer-written `ref=` -- the developer's own hand-written Go
+    /// file already declares that variable, so codegen must not declare
+    /// it a second time (a real "redeclared in this block" compile
+    /// error).
+    synthesized_ref: bool = false,
 };
 
 /// The real LSP semantic-token types this server advertises (a small
@@ -1081,22 +1115,24 @@ const Emitter = struct {
     /// identifier only) and, if so, queues a `PendingRebind` -- consumed
     /// once, at the end of `generateGo`, to actually emit it.
     ///
-    /// Scoped, for now, to non-struct-backed kinds only by its own single
-    /// call site in `emitElement` -- the 9 struct-backed kinds need their
-    /// own extra-`WrapX`-argument handling (tier 1/2/3, a later stage of
-    /// this same pass) before this can safely cover them too.
     /// `id_expr` is the caller's own already-resolved id-expression
     /// (`var_name.ID()` for a struct-backed kind, `uint32(var_name)`
     /// otherwise -- the exact same precedent `ApplyStyle`'s own call site
     /// already established). `rebind_extra_args` decides whether a full
     /// rebind function is even attempted at all: `null` means don't try
-    /// (tier-2/3 struct-backed kinds, not supported yet -- RegisterBinding
-    /// still fires regardless, since that part is always safe); a real
-    /// (possibly empty) slice means try, splicing each entry as an extra
-    /// `WrapX` argument after the widget id (empty for every non-struct-
-    /// backed kind; one entry for a tier-1 kind's own extra creation-time
-    /// attribute, e.g. Dropdown's `options=`).
-    fn emitAutoBinding(self: *Emitter, var_name: []const u8, tag: []const u8, attr_name: []const u8, handler_expr: []const u8, id_expr: []const u8, bind_kind_override: ?[]const u8, bind_args_override: ?[]const u8, rebind_extra_args: ?[]const []const u8) EmitError!void {
+    /// (the widget's own extra-`WrapX`-argument resolution -- tier-1's
+    /// `tier1ExtraWrapArgs` or tier-2/3's `tier23ExtraWrapArgs` --
+    /// couldn't safely resolve one, e.g. an unsafe-to-resplice extra
+    /// attribute; RegisterBinding still fires regardless, since that part
+    /// is always safe); a real (possibly empty) slice means try, splicing
+    /// each entry as an extra `WrapX` argument after the widget id (empty
+    /// for every non-struct-backed kind; one entry for a tier-1 kind's own
+    /// extra creation-time attribute, e.g. Dropdown's `options=`; one or
+    /// more restored-accessor-value entries, plus any of *its own* extra
+    /// creation-time attributes, for a tier-2/3 kind). `wrap_returns_error`
+    /// (see `PendingRebind`'s own doc comment) is only ever true for a
+    /// tier-2/3 `rebind_extra_args` built by `tier23ExtraWrapArgs`.
+    fn emitAutoBinding(self: *Emitter, var_name: []const u8, tag: []const u8, attr_name: []const u8, handler_expr: []const u8, id_expr: []const u8, bind_kind_override: ?[]const u8, bind_args_override: ?[]const u8, rebind_extra_args: ?[]const []const u8, wrap_returns_error: bool) EmitError!void {
         const kind = bind_kind_override orelse try std.fmt.allocPrint(self.allocator, "gen_{s}_{s}_{s}", .{ self.composer_name, var_name, attr_name });
         const args_expr = bind_args_override orelse "nil";
         try self.out.appendSlice(self.allocator, "\tif err := natyv.RegisterBinding(");
@@ -1122,6 +1158,7 @@ const Emitter = struct {
                 .attr_name = attr_name,
                 .handler_name = handler_expr,
                 .extra_wrap_args = extra_args,
+                .wrap_returns_error = wrap_returns_error,
             });
         }
     }
@@ -1136,8 +1173,11 @@ const Emitter = struct {
     /// originally written (the *same already-parsed* expression the
     /// widget's own `CreateX` call above already emitted, not a second
     /// parse). Tier-2/3 kinds (MenuBar/Dialog/Breadcrumbs/DateTimePicker/
-    /// Table/Tree) aren't handled here at all -- they need real SDK
-    /// accessor methods that don't exist yet (a later stage of this pass).
+    /// Table/Tree) aren't handled here at all -- their own creation-time
+    /// attributes alone aren't enough to reconstruct them (they also need
+    /// a real accessor method's return value, restored from the last
+    /// checkpoint) -- see `tier23AccessorSpec`/`tier23ExtraWrapArgs`
+    /// instead, called from this same call site's own caller.
     fn tier1ExtraWrapArgs(self: *Emitter, el: Parser.Element) EmitError!?[]const []const u8 {
         const attr_name = if (std.mem.eql(u8, el.tag, "Dropdown") or std.mem.eql(u8, el.tag, "Combobox"))
             "options"
@@ -1151,6 +1191,72 @@ const Emitter = struct {
         const args = try self.allocator.alloc([]const u8, 1);
         args[0] = found.expr;
         return args;
+    }
+
+    /// Part 2 (codegen automation), tier-2/3 struct-backed accessor wiring
+    /// (§3.5's `structBackedExtraArgs` resolver, corrected design -- see
+    /// `tier23ExtraWrapArgs`'s own doc comment for the real design
+    /// correction this reflects). One static entry per tier-2/3 kind:
+    /// `accessor_method` names the new SDK method (§4 of the plan) whose
+    /// *last-checkpoint* return value the rebind function will reference;
+    /// `extra_attrs` names, in the exact order `WrapX` itself expects them
+    /// (right after the accessor-derived arg(s)), any *other* creation-time
+    /// attribute `WrapX` also needs beyond the widget id and the accessor
+    /// result -- every one of these is already `requiredExprAttr`-enforced
+    /// at this same tag's own creation branch above, so `tier23ExtraWrapArgs`
+    /// only ever fails to find one if `isSafeToResplice` itself fails, the
+    /// same graceful-degradation shape tier-1 already has. `wrap_returns_error`
+    /// is true only for Table/Tree -- see `PendingRebind.wrap_returns_error`'s
+    /// own doc comment.
+    const Tier23Spec = struct {
+        accessor_method: []const u8,
+        extra_attrs: []const []const u8,
+        wrap_returns_error: bool,
+    };
+
+    fn tier23AccessorSpec(tag: []const u8) ?Tier23Spec {
+        if (std.mem.eql(u8, tag, "MenuBar")) return .{ .accessor_method = "TriggerIDs", .extra_attrs = &.{"entries"}, .wrap_returns_error = false };
+        if (std.mem.eql(u8, tag, "Dialog")) return .{ .accessor_method = "ButtonIDs", .extra_attrs = &.{"buttonLabels"}, .wrap_returns_error = false };
+        if (std.mem.eql(u8, tag, "Breadcrumbs")) return .{ .accessor_method = "ButtonIDs", .extra_attrs = &.{}, .wrap_returns_error = false };
+        if (std.mem.eql(u8, tag, "DateTimePicker")) return .{ .accessor_method = "CurrentValue", .extra_attrs = &.{}, .wrap_returns_error = false };
+        if (std.mem.eql(u8, tag, "Table")) return .{ .accessor_method = "Snapshot", .extra_attrs = &.{ "columns", "rows" }, .wrap_returns_error = true };
+        if (std.mem.eql(u8, tag, "Tree")) return .{ .accessor_method = "Snapshot", .extra_attrs = &.{"roots"}, .wrap_returns_error = true };
+        return null;
+    }
+
+    /// Builds a tier-2/3 `PendingRebind.extra_wrap_args`, corrected design:
+    /// the rebind function never calls the live accessor itself -- by the
+    /// time any rebind function actually runs (a real dispatch, after
+    /// `RestoreBindings`), the composer that originally set `target_name`
+    /// has not run again on a resumed instance (that's the entire premise
+    /// of resume-without-recreate), so `target_name` is nil unless nothing
+    /// else touches it, and calling e.g. `.TriggerIDs()` on it would be a
+    /// real, live nil-pointer crash, not a hypothetical one. Instead,
+    /// `natyv_generated.go` (`cli/Prepare.zig`) calls the accessor exactly
+    /// *once*, at checkpoint time -- while the composer-set `target_name`
+    /// is still valid -- and persists just its own return value; this
+    /// function only ever references the already-restored package-level
+    /// var(s) that live there (`restoredGen_<target_name>`, or, for
+    /// `CurrentValue`'s four-value return, one per field), by name. Falls
+    /// back to `null` (same "let bindKind=/bindArgs= cover it instead"
+    /// degradation every other unsupported shape already has) the moment
+    /// any of `spec.extra_attrs` isn't safe to resplice -- identical
+    /// reasoning to `tier1ExtraWrapArgs`'s own fallback.
+    fn tier23ExtraWrapArgs(self: *Emitter, el: Parser.Element, target_name: []const u8, spec: Tier23Spec) EmitError!?[]const []const u8 {
+        var args: std.ArrayList([]const u8) = .empty;
+        if (std.mem.eql(u8, spec.accessor_method, "CurrentValue")) {
+            inline for (.{ "year", "month", "hour", "minute" }) |field| {
+                try args.append(self.allocator, try std.fmt.allocPrint(self.allocator, "restoredGen_{s}_{s}", .{ target_name, field }));
+            }
+        } else {
+            try args.append(self.allocator, try std.fmt.allocPrint(self.allocator, "restoredGen_{s}", .{target_name}));
+        }
+        for (spec.extra_attrs) |attr_name| {
+            const found = (try self.exprAttr(el, attr_name)) orelse return null;
+            if (!isSafeToResplice(found.expr, self.composer_params, self.composer_raw_code_locals)) return null;
+            try args.append(self.allocator, found.expr);
+        }
+        return try args.toOwnedSlice(self.allocator);
     }
 
     /// Sensible per-tag layout defaults, applied unconditionally until a
@@ -2608,6 +2714,76 @@ const Emitter = struct {
         }
         var bind_kind_consumed = false;
 
+        // Part 2 (codegen automation), tier-2/3 struct-backed accessor
+        // wiring: resolved once, up front, same "markup attribute order
+        // isn't guaranteed" reasoning as the bindKind=/bindArgs= pre-scan
+        // above -- the isEventAttr branch below needs this element's own
+        // ref target name (real or synthesized) regardless of whether
+        // `ref=` happens to appear before or after the event attribute in
+        // the actual markup. Pre-scanned (not resolved inside the main
+        // loop's own `.ref` branch) specifically so a tag with *no* `ref=`
+        // at all still gets one synthesized here, since the main loop's
+        // `.ref` branch never fires in that case.
+        var tier23_target_name: ?[]const u8 = null;
+        const tier23_spec: ?Tier23Spec = if (self.recycle_enabled) tier23AccessorSpec(el.tag) else null;
+        if (tier23_spec) |spec| {
+            var explicit_ref: ?[]const u8 = null;
+            for (el.attrs) |attr| {
+                if (std.mem.eql(u8, attr.name, "ref")) {
+                    explicit_ref = switch (attr.value) {
+                        .ref => |r| r.target,
+                        // Malformed -- leave it to the main loop's own
+                        // `.ref` branch below to raise the real error;
+                        // this pre-scan only needs a target name when one
+                        // validly exists.
+                        else => null,
+                    };
+                }
+            }
+            // A raw-code-block-local explicit ref= (e.g. `<% var picker
+            // *widgets.DateTimePicker %>`) doesn't qualify as a usable
+            // target here -- it's function-scoped, not a package-level
+            // identifier `natyv_generated.go` (a separate file) could
+            // ever reference. Treated the same as "no ref= at all" below:
+            // synthesize codegen's own package-level handle alongside it.
+            // The two coexist harmlessly -- the developer's own local ref
+            // still gets its ordinary assignment via the main loop's
+            // `.ref` branch below, untouched, for whatever the developer
+            // uses it for within that same raw-code block.
+            const usable_explicit_ref = if (explicit_ref) |target|
+                (if (isRawCodeLocal(target, self.composer_raw_code_locals)) null else target)
+            else
+                null;
+            if (usable_explicit_ref) |target| {
+                // A real, developer-written ref= -- the main loop's own
+                // `.ref` branch below emits the actual assignment, in
+                // markup order, same as ever. This pre-scan only needs
+                // the name.
+                tier23_target_name = target;
+            } else {
+                // No usable ref= (none written, or a raw-code local):
+                // synthesize one, and -- since no `.ref` branch will ever
+                // populate a *package-level* target for this element --
+                // emit its assignment right here. Statement order
+                // relative to this element's *other* attribute emissions
+                // doesn't matter: nothing else in this composer body ever
+                // reads this var back (only `natyv_generated.go`'s own
+                // checkpoint-time code does, in a different function
+                // entirely). Uses `el.line`/`el.col` (the tag's own
+                // position) for the source mapping -- there's no real
+                // ref-target token to point at.
+                const synthesized = try std.fmt.allocPrint(self.allocator, "genRef_{s}_{s}", .{ self.composer_name, var_name });
+                try self.emitRefAssign(synthesized, var_name, isPointerReturningWidgetKind(el.tag), el.line, el.col);
+                tier23_target_name = synthesized;
+            }
+            try self.struct_backed_snapshot_entries.append(self.allocator, .{
+                .widget_kind = el.tag,
+                .target_name = tier23_target_name.?,
+                .accessor_method = spec.accessor_method,
+                .synthesized_ref = usable_explicit_ref == null,
+            });
+        }
+
         for (el.attrs) |attr| {
             if (isSkippedAttr(attr.name, skip_attrs)) continue;
             if (self.recycle_enabled and (std.mem.eql(u8, attr.name, "bindKind") or std.mem.eql(u8, attr.name, "bindArgs"))) {
@@ -2665,8 +2841,9 @@ const Emitter = struct {
                         // construction anyway. Struct-backed kinds are
                         // deliberately untouched here -- their
                         // ref-persistence is entirely subsumed by the
-                        // tier-2/3 accessor mechanism instead (a later
-                        // stage of this same pass), never this one.
+                        // tier-2/3 accessor mechanism instead (the
+                        // pre-scan above, which already ran for this
+                        // element if it's a tier-2/3 kind), never this one.
                         if (self.recycle_enabled and !isStructBackedWidgetKind(el.tag) and !isRawCodeLocal(r.target, self.composer_raw_code_locals)) {
                             try self.ref_persist_entries.append(self.allocator, .{ .widget_kind = el.tag, .target_name = r.target });
                         }
@@ -2687,23 +2864,28 @@ const Emitter = struct {
                         // backed kinds always attempt one (zero extra
                         // args); tier-1 struct-backed kinds (Dropdown/
                         // Combobox/Menu) attempt one with their own extra
-                        // WrapX argument when it's safe to resplice; every
-                        // other struct-backed kind (tier 2/3) isn't
-                        // attempted at all yet -- their own extra-WrapX-
-                        // argument handling needs real SDK accessor
-                        // methods that don't exist yet (a later stage of
-                        // this same pass).
+                        // WrapX argument when it's safe to resplice; tier-
+                        // 2/3 kinds (MenuBar/Dialog/Breadcrumbs/
+                        // DateTimePicker/Table/Tree) attempt one via the
+                        // pre-scanned `tier23_target_name`/`tier23_spec`
+                        // above, referencing the already-restored
+                        // accessor-value var(s) `natyv_generated.go` will
+                        // populate (never calling the live accessor here --
+                        // see `tier23ExtraWrapArgs`'s own doc comment).
                         if (self.recycle_enabled) {
                             bind_kind_consumed = bind_kind_override != null;
                             const id_expr = if (isStructBackedWidgetKind(el.tag))
                                 try std.fmt.allocPrint(self.allocator, "{s}.ID()", .{var_name})
                             else
                                 try std.fmt.allocPrint(self.allocator, "uint32({s})", .{var_name});
-                            const rebind_extra_args: ?[]const []const u8 = if (isStructBackedWidgetKind(el.tag))
+                            const rebind_extra_args: ?[]const []const u8 = if (tier23_spec) |spec|
+                                try self.tier23ExtraWrapArgs(el, tier23_target_name.?, spec)
+                            else if (isStructBackedWidgetKind(el.tag))
                                 try self.tier1ExtraWrapArgs(el)
                             else
                                 &.{};
-                            try self.emitAutoBinding(var_name, el.tag, attr.name, ex.expr, id_expr, bind_kind_override, bind_args_override, rebind_extra_args);
+                            const wrap_returns_error = if (tier23_spec) |spec| spec.wrap_returns_error else false;
+                            try self.emitAutoBinding(var_name, el.tag, attr.name, ex.expr, id_expr, bind_kind_override, bind_args_override, rebind_extra_args, wrap_returns_error);
                         }
                     },
                     else => return self.fail(attr.line, attr.col, "'{s}' must be a real handler expression, e.g. {s}={{handleX}}", .{ attr.name, attr.name }),
@@ -2988,18 +3170,50 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
     // function -- `Wrap<Tag>`/`On<X>` are derived the same mechanical way
     // the create/event-binding emission above already derives
     // `CreateX`/`.OnX` from a tag/attr name, no new naming logic.
+    // Part 2 (codegen automation), tier-2/3 ref auto-synthesis: a
+    // package-level `var <target_name> *widgets.<widget_kind>` for every
+    // entry this file's own composers synthesized a ref for (a real,
+    // developer-written `ref=` needs no declaration here -- the
+    // developer's own hand-written Go file already has one, see
+    // `StructBackedSnapshotEntry.synthesized_ref`'s own doc comment).
+    // Always a pointer regardless of the widget kind's own `CreateX`
+    // shape -- see `StructBackedSnapshotEntry.target_name`'s own doc
+    // comment for why.
+    for (struct_backed_snapshot_entries.items) |e| {
+        if (!e.synthesized_ref) continue;
+        try body.appendSlice(allocator, "\nvar ");
+        try body.appendSlice(allocator, e.target_name);
+        try body.appendSlice(allocator, " *widgets.");
+        try body.appendSlice(allocator, e.widget_kind);
+        try body.appendSlice(allocator, "\n");
+    }
+
     if (pending_rebinds.items.len > 0) {
         for (pending_rebinds.items) |pr| {
             try body.appendSlice(allocator, "\nfunc rebind_");
             try body.appendSlice(allocator, pr.kind);
-            try body.appendSlice(allocator, "(widgetID uint32, args json.RawMessage) error {\n\t_ = args\n\twidgets.Wrap");
+            try body.appendSlice(allocator, "(widgetID uint32, args json.RawMessage) error {\n\t_ = args\n\t");
+            // Table/Tree's WrapX returns (T, error) -- every other WrapX
+            // in this SDK, tier-1 struct-backed kinds included, returns a
+            // bare value chainable directly. See
+            // `PendingRebind.wrap_returns_error`'s own doc comment.
+            if (pr.wrap_returns_error) {
+                try body.appendSlice(allocator, "w, err := widgets.Wrap");
+            } else {
+                try body.appendSlice(allocator, "widgets.Wrap");
+            }
             try body.appendSlice(allocator, pr.widget_tag);
             try body.appendSlice(allocator, "(widgetID");
             for (pr.extra_wrap_args) |arg| {
                 try body.appendSlice(allocator, ", ");
                 try body.appendSlice(allocator, arg);
             }
-            try body.appendSlice(allocator, ").On");
+            try body.appendSlice(allocator, ")");
+            if (pr.wrap_returns_error) {
+                try body.appendSlice(allocator, "\n\tif err != nil {\n\t\treturn err\n\t}\n\tw.On");
+            } else {
+                try body.appendSlice(allocator, ".On");
+            }
             try body.append(allocator, pr.attr_name[2]);
             try body.appendSlice(allocator, pr.attr_name[3..]);
             try body.appendSlice(allocator, "(");
@@ -3258,14 +3472,16 @@ test "tier 1: an unsafe options= expression (references a composer param) still 
     try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
 }
 
-test "tier 2/3: a struct-backed kind with no accessor support yet (MenuBar) still gets RegisterBinding, but no rebind function" {
+test "tier 2/3: MenuBar with no ref= gets a synthesized package-level ref, a StructBackedSnapshotEntry, and a full rebind function referencing the not-yet-restored accessor var" {
     // Real regression this guards: a plain WrapMenuBar(widgetID) call --
     // the tier-1 template applied to a kind that actually needs an
     // ordered trigger-id list too -- would be a genuine "not enough
-    // arguments" compile error against the real SDK signature. Confirms
-    // RegisterBinding (always mechanical, lifted for every kind this
-    // stage) doesn't accidentally also unlock rebind generation for a
-    // kind whose real WrapX extra-argument handling doesn't exist yet.
+    // arguments" compile error against the real SDK signature. This
+    // confirms the tier-2/3 accessor mechanism closes that gap: the
+    // rebind function references `restoredGen_<ref>` (populated by
+    // `natyv_generated.go`, a separate file, at resume time) rather than
+    // calling the live accessor itself, which would nil-panic (see
+    // `tier23ExtraWrapArgs`'s own doc comment for why).
     const src =
         \\package main
         \\
@@ -3283,11 +3499,155 @@ test "tier 2/3: a struct-backed kind with no accessor support yet (MenuBar) stil
     try std.testing.expect(found.err == null);
     const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
     try std.testing.expect(result.err == null);
+    const output = result.output.?;
+    const gen = output.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "genRef_Toolbar_MenuBar0 = MenuBar0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "var genRef_Toolbar_MenuBar0 *widgets.MenuBar") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "if err := natyv.RegisterBinding(MenuBar0.ID(), \"gen_Toolbar_MenuBar0_onSelect\", nil); err != nil {\n\t\treturn err\n\t}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_gen_Toolbar_MenuBar0_onSelect(widgetID uint32, args json.RawMessage) error {\n\t_ = args\n\twidgets.WrapMenuBar(widgetID, restoredGen_genRef_Toolbar_MenuBar0, entries).OnSelect(handleMenuBarSelect)\n\treturn nil\n}") != null);
+
+    try std.testing.expectEqual(@as(usize, 1), output.struct_backed_snapshot_entries.len);
+    const e = output.struct_backed_snapshot_entries[0];
+    try std.testing.expectEqualStrings("MenuBar", e.widget_kind);
+    try std.testing.expectEqualStrings("genRef_Toolbar_MenuBar0", e.target_name);
+    try std.testing.expectEqualStrings("TriggerIDs", e.accessor_method);
+    try std.testing.expect(e.synthesized_ref);
+}
+
+test "tier 2/3: Breadcrumbs with an explicit ref= reuses the developer's own var, no synthesized decl, no extra WrapX arg beyond the accessor" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <Breadcrumbs ref={&myTrail} crumbs={path} separator="/" onCrumbClick={handleCrumbClick} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+    const gen = output.generated;
+
+    // The developer's own ref -- still assigned exactly as it always was
+    // (Mechanism 1-independent, since Breadcrumbs is struct-backed).
+    try std.testing.expect(std.mem.indexOf(u8, gen, "myTrail = &Breadcrumbs0") != null);
+    // No codegen-synthesized decl -- myTrail is the developer's own.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "var myTrail") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_gen_Toolbar_Breadcrumbs0_onCrumbClick(widgetID uint32, args json.RawMessage) error {\n\t_ = args\n\twidgets.WrapBreadcrumbs(widgetID, restoredGen_myTrail).OnCrumbClick(handleCrumbClick)\n\treturn nil\n}") != null);
+
+    try std.testing.expectEqual(@as(usize, 1), output.struct_backed_snapshot_entries.len);
+    try std.testing.expect(!output.struct_backed_snapshot_entries[0].synthesized_ref);
+    try std.testing.expectEqualStrings("myTrail", output.struct_backed_snapshot_entries[0].target_name);
+}
+
+test "tier 2/3: DateTimePicker's four-value CurrentValue() splits into four separately-restored args, in WrapDateTimePicker's own order" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <DateTimePicker year={2026} month={9} hour={0} minute={0} onSelect={handlePick}>Pick</DateTimePicker>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
 
-    try std.testing.expect(std.mem.indexOf(u8, gen, "RegisterBinding(MenuBar0.ID()") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        gen,
+        "widgets.WrapDateTimePicker(widgetID, restoredGen_genRef_Toolbar_DateTimePicker0_year, restoredGen_genRef_Toolbar_DateTimePicker0_month, restoredGen_genRef_Toolbar_DateTimePicker0_hour, restoredGen_genRef_Toolbar_DateTimePicker0_minute).OnSelect(handlePick)",
+    ) != null);
+}
+
+test "tier 2/3: Table (WrapTable returns (T, error)) captures w/err locals before chaining OnSelect, extra columns=/rows= re-spliced after the snapshot" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <Table columns={cols} rows={rows} rowHeight={28} onSelect={handleRowSelect} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_gen_Toolbar_Table0_onSelect(widgetID uint32, args json.RawMessage) error {\n\t_ = args\n\tw, err := widgets.WrapTable(widgetID, restoredGen_genRef_Toolbar_Table0, cols, rows)\n\tif err != nil {\n\t\treturn err\n\t}\n\tw.OnSelect(handleRowSelect)\n\treturn nil\n}") != null);
+}
+
+test "tier 2/3: Tree's own single extra roots= attribute lands after the snapshot arg, same (T, error) capture as Table" {
+    const src =
+        \\package main
+        \\
+        \\expose Toolbar
+        \\
+        \\func Toolbar(parent widgets.Container) error {
+        \\  <Tree roots={rootNodes} rowHeight={24} onSelect={handleNodeSelect} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "w, err := widgets.WrapTree(widgetID, restoredGen_genRef_Toolbar_Tree0, rootNodes)\n\tif err != nil {\n\t\treturn err\n\t}\n\tw.OnSelect(handleNodeSelect)") != null);
+}
+
+test "tier 2/3: an unsafe extra attribute (references a composer param) still gets RegisterBinding but no rebind function, same escape-hatch fallback as tier 1" {
+    const src =
+        \\package main
+        \\
+        \\expose FolderView
+        \\
+        \\func FolderView(parent widgets.Container, dialogButtonLabels []string) error {
+        \\  <Dialog message="Sure?" buttonLabels={dialogButtonLabels} onResult={handleDialogResult} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+    const gen = output.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "RegisterBinding(Dialog0.ID()") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
-    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateMenuBar") != null);
+    // The synthesized ref/snapshot entry still exists -- only the rebind
+    // *function* falls back to the escape hatch; RegisterBinding and the
+    // checkpoint-time accessor snapshot are always safe regardless.
+    try std.testing.expectEqual(@as(usize, 1), output.struct_backed_snapshot_entries.len);
 }
 
 test "bindKind=/bindArgs=: a composer-param handler gets RegisterBinding with the override kind/args, no auto rebind function" {
