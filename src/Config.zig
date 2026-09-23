@@ -272,7 +272,43 @@ pub const UiConfig = struct {
     /// `"clay"` is the only recognized value today; `"yoga"` is reserved
     /// for when that backend actually gets built (see project memory).
     backend: ?[]const u8 = null,
+    /// The window's own background fill, as `#RRGGBB` or `#RRGGBBAA`.
+    /// `null` (the default) keeps natyv's built-in dark ground, `#18181C`.
+    ///
+    /// Window-level rather than an `.ntss` token on purpose: this is the
+    /// color SDL clears the renderer to before any widget draws at all, so
+    /// it belongs to the window, not to any element in the tree. `.ntss`'s
+    /// own `backgroundColor` stays per-element and is unaffected.
+    ///
+    /// Parse it with `parseHexRgba` -- a malformed value is a real startup
+    /// error, not a silent fallback, matching the stylesheet resolver's own
+    /// posture that a typo should be caught before it ever ships.
+    background_color: ?[]const u8 = null,
 };
+
+/// A plain 8-bit-per-channel color. Deliberately not the styling
+/// `Resolver.Color` (normalized f32): that type lives in the `styling`
+/// module, which `natyv-core` doesn't import -- core only ever pulls in
+/// `Config` (see natyv-io/core's build.zig), and adding a whole module
+/// dependency for one color parse would be the wrong trade.
+pub const Rgba = struct { r: u8, g: u8, b: u8, a: u8 };
+
+/// Parses `#RRGGBB` / `#RRGGBBAA`, returning null on anything malformed.
+///
+/// **Deliberately the same grammar** `styling/Resolver.zig`'s own
+/// `parseHexColor` accepts, so a color written in `conf.natyv.json` and the
+/// same color written in an `.ntss` file never disagree. That is two
+/// parsers for one syntax; they are kept in sync by hand today. If a third
+/// consumer ever appears, extract a shared one rather than adding another.
+pub fn parseHexRgba(s: []const u8) ?Rgba {
+    if (s.len != 7 and s.len != 9) return null;
+    if (s[0] != '#') return null;
+    const r = std.fmt.parseInt(u8, s[1..3], 16) catch return null;
+    const g = std.fmt.parseInt(u8, s[3..5], 16) catch return null;
+    const b = std.fmt.parseInt(u8, s[5..7], 16) catch return null;
+    const a = if (s.len == 9) std.fmt.parseInt(u8, s[7..9], 16) catch return null else 255;
+    return .{ .r = r, .g = g, .b = b, .a = a };
+}
 
 /// Used both as the window title and as SDL_GetPrefPath's app-name
 /// namespace component for where per-app data (e.g. the sqlite file) gets
@@ -413,6 +449,35 @@ test "ui.backend: clay opts an app into the natyv_clay_* host functions" {
     const parsed = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\",\"ui\":{\"backend\":\"clay\"}}");
     defer parsed.deinit();
     try std.testing.expectEqualStrings("clay", parsed.value.ui.backend.?);
+}
+
+test "ui.background_color: absent by default, parsed when present" {
+    const allocator = std.testing.allocator;
+    const bare = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer bare.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.value.ui.background_color);
+
+    const set = try parseBytes(allocator, "{\"wasm_compile\":\"x\",\"ui\":{\"background_color\":\"#101014\"}}");
+    defer set.deinit();
+    try std.testing.expectEqualStrings("#101014", set.value.ui.background_color.?);
+}
+
+test "parseHexRgba accepts #RRGGBB and #RRGGBBAA, rejects everything else" {
+    const opaque_color = parseHexRgba("#18181C").?;
+    try std.testing.expectEqual(@as(u8, 0x18), opaque_color.r);
+    try std.testing.expectEqual(@as(u8, 0x18), opaque_color.g);
+    try std.testing.expectEqual(@as(u8, 0x1C), opaque_color.b);
+    try std.testing.expectEqual(@as(u8, 255), opaque_color.a);
+
+    const with_alpha = parseHexRgba("#18181C80").?;
+    try std.testing.expectEqual(@as(u8, 0x80), with_alpha.a);
+
+    // The real failure modes: no hash, wrong length, non-hex digits.
+    try std.testing.expect(parseHexRgba("18181C") == null);
+    try std.testing.expect(parseHexRgba("#18181") == null);
+    try std.testing.expect(parseHexRgba("#18181CC") == null);
+    try std.testing.expect(parseHexRgba("#GGGGGG") == null);
+    try std.testing.expect(parseHexRgba("") == null);
 }
 
 test "app_wasm is no longer a recognized field -- silently ignored, not required" {
