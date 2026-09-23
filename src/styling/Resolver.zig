@@ -60,6 +60,23 @@ pub const Scroll = enum { vertical, horizontal, both };
 pub const SizingKind = enum { fixed, grow, fit, percent };
 pub const Sizing = struct { kind: SizingKind, value: f32 = 0 };
 
+/// The reserved top-level `.ntss` token naming the window itself rather
+/// than a widget style. Syntactically it is just another `IDENT block`
+/// (see Stylesheet.zig's grammar), so the parser needs no change -- this
+/// resolver is what gives the name meaning, and what keeps it out of the
+/// style-token map a guest applies to widgets.
+pub const window_token_name = "window";
+
+/// Window-level appearance, resolved from the reserved `window` block.
+/// Separate from `ResolvedStyleToken` on purpose: these values never reach
+/// a widget. They are consumed host-side (natyv-core clears the window to
+/// `background_color` before any widget draws at all), which is also why
+/// the vocabulary here is deliberately its own closed set rather than the
+/// style vocabulary minus the inapplicable parts.
+pub const ResolvedWindow = struct {
+    background_color: ?Color = null,
+};
+
 /// Layout properties (`direction`/`childGap`/`width`/`height`/`alignX`/
 /// `alignY`, alongside the already-existing `margin`) are deliberately
 /// **never** emitted into `styling/Codegen.zig`'s `widgets.ResolvedStyle`
@@ -321,27 +338,106 @@ const Resolver = struct {
         }
         return out;
     }
+
+    /// Resolves the reserved `window` block. Its own closed vocabulary --
+    /// a widget style field like `cornerRadius` is a real error here, not
+    /// silently ignored, because it would look like it worked while doing
+    /// nothing at all.
+    fn resolveWindowToken(self: *Resolver, token: Stylesheet.StyleToken) Error!ResolvedWindow {
+        var out: ResolvedWindow = .{};
+        for (token.fields) |field| {
+            if (std.mem.eql(u8, field.key, "backgroundColor")) {
+                out.background_color = try self.resolveColorField(field);
+            } else {
+                return self.fail(field.line, field.col, "unrecognized window field '{s}' (the window block accepts only 'backgroundColor' today)", .{field.key});
+            }
+        }
+        return out;
+    }
 };
 
-pub fn resolve(allocator: std.mem.Allocator, sheet: Stylesheet.StyleSheet) error{OutOfMemory}!struct { tokens: []ResolvedStyleToken, err: ?ResolveError } {
+pub fn resolve(allocator: std.mem.Allocator, sheet: Stylesheet.StyleSheet) error{OutOfMemory}!struct { tokens: []ResolvedStyleToken, window: ?ResolvedWindow, err: ?ResolveError } {
     var resolver: Resolver = .{ .allocator = allocator };
     var out: std.ArrayList(ResolvedStyleToken) = .empty;
     errdefer out.deinit(allocator);
+    var window: ?ResolvedWindow = null;
     for (sheet.tokens) |token| {
+        // The reserved `window` block is pulled out here rather than
+        // resolved as a style token: it never applies to a widget, so
+        // letting it into `tokens` would put a bogus entry in the
+        // StyleTokens map a guest indexes by name.
+        if (std.mem.eql(u8, token.name, window_token_name)) {
+            window = resolver.resolveWindowToken(token) catch |e| {
+                if (e == error.ResolveError) return .{ .tokens = &.{}, .window = null, .err = resolver.last_error };
+                return error.OutOfMemory;
+            };
+            continue;
+        }
         const resolved = resolver.resolveToken(token) catch |e| {
-            if (e == error.ResolveError) return .{ .tokens = &.{}, .err = resolver.last_error };
+            if (e == error.ResolveError) return .{ .tokens = &.{}, .window = null, .err = resolver.last_error };
             return error.OutOfMemory;
         };
         try out.append(allocator, resolved);
     }
-    return .{ .tokens = try out.toOwnedSlice(allocator), .err = null };
+    return .{ .tokens = try out.toOwnedSlice(allocator), .window = window, .err = null };
 }
 
-fn parseAndResolve(allocator: std.mem.Allocator, src: []const u8) !struct { tokens: []ResolvedStyleToken, parse_err: ?Stylesheet.ParseError, resolve_err: ?ResolveError } {
+fn parseAndResolve(allocator: std.mem.Allocator, src: []const u8) !struct { tokens: []ResolvedStyleToken, window: ?ResolvedWindow, parse_err: ?Stylesheet.ParseError, resolve_err: ?ResolveError } {
     const parsed = try Stylesheet.parse(allocator, src);
-    if (parsed.err) |e| return .{ .tokens = &.{}, .parse_err = e, .resolve_err = null };
+    if (parsed.err) |e| return .{ .tokens = &.{}, .window = null, .parse_err = e, .resolve_err = null };
     const resolved = try resolve(allocator, parsed.sheet);
-    return .{ .tokens = resolved.tokens, .parse_err = null, .resolve_err = resolved.err };
+    return .{ .tokens = resolved.tokens, .window = resolved.window, .parse_err = null, .resolve_err = resolved.err };
+}
+
+test "the reserved window block resolves separately and stays out of the style tokens" {
+    const src =
+        \\window { backgroundColor: "#2A1A4A" }
+        \\card { backgroundColor: "#111111" }
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err == null);
+
+    // Resolved, and NOT present as a style token -- a guest indexing
+    // StyleTokens by name must never find a bogus "window" entry.
+    try std.testing.expect(result.window != null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0x2A) / 255.0, result.window.?.background_color.?.r, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), result.tokens.len);
+    try std.testing.expectEqualStrings("card", result.tokens[0].name);
+}
+
+test "a stylesheet with no window block resolves to a null window" {
+    const src =
+        \\card { backgroundColor: "#111111" }
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err == null);
+    try std.testing.expect(result.window == null);
+}
+
+test "the window block has its own closed vocabulary" {
+    // A real style field is an error here, not silently ignored -- it
+    // would otherwise look like it worked while doing nothing.
+    const src =
+        \\window { cornerRadius: {4, 4, 4, 4} }
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err != null);
+}
+
+test "a malformed window color is a real error, same as a style one" {
+    const src =
+        \\window { backgroundColor: "not-a-color" }
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err != null);
 }
 
 test "resolves a full valid token" {
