@@ -75,6 +75,13 @@ pub const window_token_name = "window";
 /// style vocabulary minus the inapplicable parts.
 pub const ResolvedWindow = struct {
     background_color: ?Color = null,
+    /// Plain pixel counts, deliberately NOT the `Sizing` vocabulary a
+    /// style token's own `width`/`height` use. `grow`/`fit`/`percent` are
+    /// Clay layout concepts with no meaning for an OS window, so accepting
+    /// them here would parse something unimplementable. Same field names,
+    /// different types, on purpose -- see `resolveWindowToken`.
+    width: ?u16 = null,
+    height: ?u16 = null,
 };
 
 /// Layout properties (`direction`/`childGap`/`width`/`height`/`alignX`/
@@ -147,6 +154,15 @@ const Resolver = struct {
         const n = try self.expectNumber(field);
         if (n < 0 or n > std.math.maxInt(u16)) return self.fail(field.line, field.col, "field '{s}' value {d} is out of range", .{ field.key, n });
         return @intFromFloat(n);
+    }
+
+    /// A window dimension: a plain pixel count, not a `Sizing`. Rejects
+    /// zero, which `expectU16` would otherwise accept and which produces a
+    /// window nobody can see.
+    fn expectWindowDimension(self: *Resolver, field: Stylesheet.Field) Error!u16 {
+        const n = try self.expectU16(field);
+        if (n == 0) return self.fail(field.line, field.col, "window '{s}' must be greater than zero", .{field.key});
+        return n;
     }
 
     fn parseHexColor(self: *Resolver, field: Stylesheet.Field, s: []const u8) Error!Color {
@@ -348,8 +364,12 @@ const Resolver = struct {
         for (token.fields) |field| {
             if (std.mem.eql(u8, field.key, "backgroundColor")) {
                 out.background_color = try self.resolveColorField(field);
+            } else if (std.mem.eql(u8, field.key, "width")) {
+                out.width = try self.expectWindowDimension(field);
+            } else if (std.mem.eql(u8, field.key, "height")) {
+                out.height = try self.expectWindowDimension(field);
             } else {
-                return self.fail(field.line, field.col, "unrecognized window field '{s}' (the window block accepts only 'backgroundColor' today)", .{field.key});
+                return self.fail(field.line, field.col, "unrecognized window field '{s}' (the window block accepts 'backgroundColor', 'width' and 'height')", .{field.key});
             }
         }
         return out;
@@ -405,6 +425,40 @@ test "the reserved window block resolves separately and stays out of the style t
     try std.testing.expectApproxEqAbs(@as(f32, 0x2A) / 255.0, result.window.?.background_color.?.r, 0.001);
     try std.testing.expectEqual(@as(usize, 1), result.tokens.len);
     try std.testing.expectEqualStrings("card", result.tokens[0].name);
+}
+
+test "the window block resolves width and height as plain pixel counts" {
+    const src =
+        \\window { backgroundColor: "#2A1A4A", width: 1280, height: 800 }
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err == null);
+    try std.testing.expectEqual(@as(u16, 1280), result.window.?.width.?);
+    try std.testing.expectEqual(@as(u16, 800), result.window.?.height.?);
+}
+
+test "window width/height reject the Sizing vocabulary a style token accepts" {
+    // `grow` is valid for a style token's width; it is meaningless for an
+    // OS window, so it must not silently parse here.
+    const src =
+        \\window { width: grow }
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err != null);
+}
+
+test "a zero window dimension is rejected" {
+    const src =
+        \\window { width: 0, height: 600 }
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err != null);
 }
 
 test "a stylesheet with no window block resolves to a null window" {

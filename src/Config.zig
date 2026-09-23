@@ -284,6 +284,15 @@ pub const UiConfig = struct {
     /// error, not a silent fallback, matching the stylesheet resolver's own
     /// posture that a typo should be caught before it ever ships.
     background_color: ?[]const u8 = null,
+    /// The startup window's size in pixels. `null` (the default) uses
+    /// natyv's own 900x700.
+    ///
+    /// Only the startup window: a window the guest opens itself via
+    /// `natyv_clay_create_window` passes its own explicit size, and is
+    /// deliberately never overridden by this -- the guest asked for those
+    /// dimensions on purpose.
+    width: ?u16 = null,
+    height: ?u16 = null,
 };
 
 /// A plain 8-bit-per-channel color. Deliberately not the styling
@@ -460,6 +469,19 @@ test "ui.background_color: absent by default, parsed when present" {
     const set = try parseBytes(allocator, "{\"wasm_compile\":\"x\",\"ui\":{\"background_color\":\"#101014\"}}");
     defer set.deinit();
     try std.testing.expectEqualStrings("#101014", set.value.ui.background_color.?);
+}
+
+test "ui.width/height: absent by default, parsed when present" {
+    const allocator = std.testing.allocator;
+    const bare = try parseBytes(allocator, "{\"wasm_compile\":\"x\"}");
+    defer bare.deinit();
+    try std.testing.expectEqual(@as(?u16, null), bare.value.ui.width);
+    try std.testing.expectEqual(@as(?u16, null), bare.value.ui.height);
+
+    const set = try parseBytes(allocator, "{\"wasm_compile\":\"x\",\"ui\":{\"width\":1280,\"height\":800}}");
+    defer set.deinit();
+    try std.testing.expectEqual(@as(u16, 1280), set.value.ui.width.?);
+    try std.testing.expectEqual(@as(u16, 800), set.value.ui.height.?);
 }
 
 test "parseHexRgba accepts #RRGGBB and #RRGGBBAA, rejects everything else" {
