@@ -73,6 +73,23 @@ pub const window_token_name = "window";
 /// `background_color` before any widget draws at all), which is also why
 /// the vocabulary here is deliberately its own closed set rather than the
 /// style vocabulary minus the inapplicable parts.
+/// The reserved top-level `.ntss` token naming the app's own default
+/// font. Like `window`, syntactically just another `IDENT block`.
+pub const font_token_name = "font";
+
+/// The app-wide default font, resolved from the reserved `font` block.
+///
+/// `file` is a path into the app's `assets/` directory, the same shape a
+/// style token's `texture` uses -- natyv embeds a real font file, it does
+/// not look up a system family. The field is deliberately NOT called
+/// `family`: that name is reserved for per-widget font selection, where it
+/// would mean a registered family name rather than a path.
+pub const ResolvedFont = struct {
+    file: ?[]const u8 = null,
+    /// Point size. Fractional sizes are real, so f32 rather than u16.
+    size: ?f32 = null,
+};
+
 pub const ResolvedWindow = struct {
     background_color: ?Color = null,
     /// Plain pixel counts, deliberately NOT the `Sizing` vocabulary a
@@ -359,6 +376,24 @@ const Resolver = struct {
     /// a widget style field like `cornerRadius` is a real error here, not
     /// silently ignored, because it would look like it worked while doing
     /// nothing at all.
+    /// Resolves the reserved `font` block -- its own closed vocabulary,
+    /// same posture as `resolveWindowToken`.
+    fn resolveFontToken(self: *Resolver, token: Stylesheet.StyleToken) Error!ResolvedFont {
+        var out: ResolvedFont = .{};
+        for (token.fields) |field| {
+            if (std.mem.eql(u8, field.key, "file")) {
+                out.file = try self.expectString(field);
+            } else if (std.mem.eql(u8, field.key, "size")) {
+                const n = try self.expectNumber(field);
+                if (n <= 0) return self.fail(field.line, field.col, "font 'size' must be greater than zero", .{});
+                out.size = @floatCast(n);
+            } else {
+                return self.fail(field.line, field.col, "unrecognized font field '{s}' (the font block accepts 'file' and 'size')", .{field.key});
+            }
+        }
+        return out;
+    }
+
     fn resolveWindowToken(self: *Resolver, token: Stylesheet.StyleToken) Error!ResolvedWindow {
         var out: ResolvedWindow = .{};
         for (token.fields) |field| {
@@ -376,11 +411,12 @@ const Resolver = struct {
     }
 };
 
-pub fn resolve(allocator: std.mem.Allocator, sheet: Stylesheet.StyleSheet) error{OutOfMemory}!struct { tokens: []ResolvedStyleToken, window: ?ResolvedWindow, err: ?ResolveError } {
+pub fn resolve(allocator: std.mem.Allocator, sheet: Stylesheet.StyleSheet) error{OutOfMemory}!struct { tokens: []ResolvedStyleToken, window: ?ResolvedWindow, font: ?ResolvedFont, err: ?ResolveError } {
     var resolver: Resolver = .{ .allocator = allocator };
     var out: std.ArrayList(ResolvedStyleToken) = .empty;
     errdefer out.deinit(allocator);
     var window: ?ResolvedWindow = null;
+    var font: ?ResolvedFont = null;
     for (sheet.tokens) |token| {
         // The reserved `window` block is pulled out here rather than
         // resolved as a style token: it never applies to a widget, so
@@ -388,25 +424,32 @@ pub fn resolve(allocator: std.mem.Allocator, sheet: Stylesheet.StyleSheet) error
         // StyleTokens map a guest indexes by name.
         if (std.mem.eql(u8, token.name, window_token_name)) {
             window = resolver.resolveWindowToken(token) catch |e| {
-                if (e == error.ResolveError) return .{ .tokens = &.{}, .window = null, .err = resolver.last_error };
+                if (e == error.ResolveError) return .{ .tokens = &.{}, .window = null, .font = null, .err = resolver.last_error };
+                return error.OutOfMemory;
+            };
+            continue;
+        }
+        if (std.mem.eql(u8, token.name, font_token_name)) {
+            font = resolver.resolveFontToken(token) catch |e| {
+                if (e == error.ResolveError) return .{ .tokens = &.{}, .window = null, .font = null, .err = resolver.last_error };
                 return error.OutOfMemory;
             };
             continue;
         }
         const resolved = resolver.resolveToken(token) catch |e| {
-            if (e == error.ResolveError) return .{ .tokens = &.{}, .window = null, .err = resolver.last_error };
+            if (e == error.ResolveError) return .{ .tokens = &.{}, .window = null, .font = null, .err = resolver.last_error };
             return error.OutOfMemory;
         };
         try out.append(allocator, resolved);
     }
-    return .{ .tokens = try out.toOwnedSlice(allocator), .window = window, .err = null };
+    return .{ .tokens = try out.toOwnedSlice(allocator), .window = window, .font = font, .err = null };
 }
 
-fn parseAndResolve(allocator: std.mem.Allocator, src: []const u8) !struct { tokens: []ResolvedStyleToken, window: ?ResolvedWindow, parse_err: ?Stylesheet.ParseError, resolve_err: ?ResolveError } {
+fn parseAndResolve(allocator: std.mem.Allocator, src: []const u8) !struct { tokens: []ResolvedStyleToken, window: ?ResolvedWindow, font: ?ResolvedFont, parse_err: ?Stylesheet.ParseError, resolve_err: ?ResolveError } {
     const parsed = try Stylesheet.parse(allocator, src);
-    if (parsed.err) |e| return .{ .tokens = &.{}, .window = null, .parse_err = e, .resolve_err = null };
+    if (parsed.err) |e| return .{ .tokens = &.{}, .window = null, .font = null, .parse_err = e, .resolve_err = null };
     const resolved = try resolve(allocator, parsed.sheet);
-    return .{ .tokens = resolved.tokens, .window = resolved.window, .parse_err = null, .resolve_err = resolved.err };
+    return .{ .tokens = resolved.tokens, .window = resolved.window, .font = resolved.font, .parse_err = null, .resolve_err = resolved.err };
 }
 
 test "the reserved window block resolves separately and stays out of the style tokens" {
@@ -459,6 +502,52 @@ test "a zero window dimension is rejected" {
     defer arena.deinit();
     const result = try parseAndResolve(arena.allocator(), src);
     try std.testing.expect(result.resolve_err != null);
+}
+
+test "the reserved font block resolves file and size, staying out of the style tokens" {
+    const src =
+        \\font { file: "Roboto-Regular.ttf", size: 18 }
+        \\card { backgroundColor: "#111111" }
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err == null);
+    try std.testing.expectEqualStrings("Roboto-Regular.ttf", result.font.?.file.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 18), result.font.?.size.?, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), result.tokens.len);
+    try std.testing.expectEqualStrings("card", result.tokens[0].name);
+}
+
+test "the font block has its own closed vocabulary and rejects a non-positive size" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // `family` is deliberately NOT accepted -- reserved for per-widget
+    // font selection, where it would mean a registered family name.
+    const bad_field =
+        \\font { family: "Roboto" }
+    ;
+    try std.testing.expect((try parseAndResolve(arena.allocator(), bad_field)).resolve_err != null);
+
+    const zero_size =
+        \\font { size: 0 }
+    ;
+    try std.testing.expect((try parseAndResolve(arena.allocator(), zero_size)).resolve_err != null);
+}
+
+test "window and font blocks coexist in one stylesheet" {
+    const src =
+        \\window { backgroundColor: "#101014" }
+        \\font { file: "F.ttf" }
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err == null);
+    try std.testing.expect(result.window != null);
+    try std.testing.expect(result.font != null);
+    try std.testing.expectEqual(@as(usize, 0), result.tokens.len);
 }
 
 test "a stylesheet with no window block resolves to a null window" {

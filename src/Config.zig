@@ -293,6 +293,17 @@ pub const UiConfig = struct {
     /// dimensions on purpose.
     width: ?u16 = null,
     height: ?u16 = null,
+    /// The app's own default font: a path into the `assets/` directory,
+    /// the same shape a style token's `texture` uses. `null` (the default)
+    /// keeps natyv's bundled Inter.
+    ///
+    /// App-wide. Per-widget font selection is a separate, later feature --
+    /// natyv threads a single `*TTF_Font` through its whole render path
+    /// today, so one font is what the runtime can currently express.
+    font: ?[]const u8 = null,
+    /// Point size for that font, app-wide. `null` keeps natyv's 16.0.
+    /// Fractional sizes are real, hence f32.
+    font_size: ?f32 = null,
 };
 
 /// A plain 8-bit-per-channel color. Deliberately not the styling
@@ -482,6 +493,19 @@ test "ui.width/height: absent by default, parsed when present" {
     defer set.deinit();
     try std.testing.expectEqual(@as(u16, 1280), set.value.ui.width.?);
     try std.testing.expectEqual(@as(u16, 800), set.value.ui.height.?);
+}
+
+test "ui.font/font_size: absent by default, parsed when present" {
+    const allocator = std.testing.allocator;
+    const bare = try parseBytes(allocator, "{\"wasm_compile\":\"x\"}");
+    defer bare.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.value.ui.font);
+    try std.testing.expectEqual(@as(?f32, null), bare.value.ui.font_size);
+
+    const set = try parseBytes(allocator, "{\"wasm_compile\":\"x\",\"ui\":{\"font\":\"R.ttf\",\"font_size\":18.5}}");
+    defer set.deinit();
+    try std.testing.expectEqualStrings("R.ttf", set.value.ui.font.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 18.5), set.value.ui.font_size.?, 0.001);
 }
 
 test "parseHexRgba accepts #RRGGBB and #RRGGBBAA, rejects everything else" {
