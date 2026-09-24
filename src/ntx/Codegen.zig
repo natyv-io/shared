@@ -1990,7 +1990,7 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ", false, 0)\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "Label")) {
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(300), .height = fixedSizing(24) }, layout_style), style_names);
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(300), .height = fitSizing() }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateLabel(");
@@ -2000,7 +2000,7 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attrs = &.{"text"};
         } else if (std.mem.eql(u8, el.tag, "Button")) {
-            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style), style_names);
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fitSizing(), .height = fitSizing() }, layout_style), style_names);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateButton(");
@@ -4637,9 +4637,13 @@ test "styles naming a token overrides a leaf widget's own hardcoded fixed size" 
     const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{}, false);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
-    // Width overridden from Button's own hardcoded 120; Height (32) is
-    // untouched since the token never set it.
-    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.Sizing{Width: widgets.Fixed(200), Height: widgets.Fixed(32)}") != null);
+    // Width overridden from Button's own default; Height is untouched
+    // since the token never set it -- and Button's default height is now
+    // Fit, so the untouched value is Fit() rather than the old Fixed(32).
+    // A Button sizes to its own label text (natyv-io/core measures it and
+    // drives Clay's Fit from that), so a hardcoded height could not hold
+    // once the font became configurable.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.Sizing{Width: widgets.Fixed(200), Height: widgets.Fit()}") != null);
 }
 
 test "an unknown style name contributes no margin and causes no error" {
