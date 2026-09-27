@@ -137,6 +137,43 @@ pub const NetworkConfig = struct {
     tcp: TcpConfig = .{},
 };
 
+/// A USB vendor or product id. Accepts a JSON number or a string, and a
+/// string may carry a `0x` prefix -- vendor/product ids are written in hex
+/// everywhere they're published (`lsusb`, System Information, datasheets),
+/// and JSON has no hex literal, so forcing decimal here would mean every dev
+/// converting by hand. Anything that doesn't fit a u16 fails the whole
+/// config load rather than silently matching nothing at runtime.
+pub const HidId = struct {
+    value: u16,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!HidId {
+        const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const slice = switch (token) {
+            inline .number, .allocated_number, .string, .allocated_string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        // Base 0 reads the `0x` prefix itself; without one it's decimal.
+        return .{ .value = std.fmt.parseInt(u16, slice, 0) catch return error.InvalidNumber };
+    }
+};
+
+/// One HID device a guest may open -- see `natyv-hid-capability` memory for
+/// the full design. Exact vendor+product match, no wildcards, the same
+/// posture as `AllowedSocket`. Every interface a matching device exposes is
+/// admitted: the OS enumerates each one separately, and they all belong to
+/// the device this entry names.
+pub const AllowedDevice = struct {
+    vendor_id: HidId,
+    product_id: HidId,
+};
+
+pub const HidConfig = struct {
+    enabled: bool = false,
+    /// Ignored (treated as no devices allowed) if `enabled` is false, same
+    /// fail-safe posture as `TcpConfig.allowed_sockets`.
+    allowed_devices: []const AllowedDevice = &.{},
+};
+
 /// Same posture as SqliteConfig/NetworkConfig -- a `texture` fill in the
 /// stylesheet is a real error at `natyv prepare` time unless this is
 /// explicitly enabled, matching the styling system's own "closed
@@ -345,6 +382,7 @@ name: []const u8 = "natyv-app",
 wasm_compile: []const u8,
 sqlite: SqliteConfig = .{},
 network: NetworkConfig = .{},
+hid: HidConfig = .{},
 images: ImagesConfig = .{},
 memory: MemoryConfig = .{},
 ui: UiConfig = .{},
@@ -689,6 +727,59 @@ test "tcp.allowed_sockets: defaults to empty, tls mode defaults to none" {
     defer defaults.deinit();
     try std.testing.expectEqual(@as(usize, 0), defaults.value.network.tcp.allowed_sockets.len);
     try std.testing.expectEqual(@as(usize, 0), defaults.value.network.http.allowed_hosts.len);
+}
+
+test "hid: disabled with no devices by default" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseBytes(allocator, "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}");
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.hid.enabled);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.hid.allowed_devices.len);
+}
+
+test "hid.allowed_devices: ids parse from hex strings, decimal strings, and numbers" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseBytes(allocator,
+        \\{"wasm_compile":"tinygo build -o app.wasm .","hid":{"enabled":true,"allowed_devices":[
+        \\  {"vendor_id":"0x1234","product_id":"0xABCD"},
+        \\  {"vendor_id":"4660","product_id":43981},
+        \\  {"vendor_id":"0XFFFF","product_id":0}
+        \\]}}
+    );
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.hid.enabled);
+    const devices = parsed.value.hid.allowed_devices;
+    try std.testing.expectEqual(@as(usize, 3), devices.len);
+    try std.testing.expectEqual(@as(u16, 0x1234), devices[0].vendor_id.value);
+    try std.testing.expectEqual(@as(u16, 0xABCD), devices[0].product_id.value);
+    try std.testing.expectEqual(@as(u16, 0x1234), devices[1].vendor_id.value);
+    try std.testing.expectEqual(@as(u16, 0xABCD), devices[1].product_id.value);
+    try std.testing.expectEqual(@as(u16, 0xFFFF), devices[2].vendor_id.value);
+    try std.testing.expectEqual(@as(u16, 0), devices[2].product_id.value);
+}
+
+test "hid.allowed_devices: an id that isn't a u16 fails the whole load" {
+    const allocator = std.testing.allocator;
+    const bad = [_][]const u8{
+        \\{"wasm_compile":"x","hid":{"allowed_devices":[{"vendor_id":"0x10000","product_id":1}]}}
+        ,
+        \\{"wasm_compile":"x","hid":{"allowed_devices":[{"vendor_id":-1,"product_id":1}]}}
+        ,
+        \\{"wasm_compile":"x","hid":{"allowed_devices":[{"vendor_id":"usb","product_id":1}]}}
+        ,
+        \\{"wasm_compile":"x","hid":{"allowed_devices":[{"vendor_id":true,"product_id":1}]}}
+        ,
+        \\{"wasm_compile":"x","hid":{"allowed_devices":[{"vendor_id":1.5,"product_id":1}]}}
+        ,
+        \\{"wasm_compile":"x","hid":{"allowed_devices":[{"vendor_id":1}]}}
+        ,
+    };
+    for (bad) |json| {
+        if (parseBytes(allocator, json)) |parsed| {
+            parsed.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
 }
 
 test "tcp.allowed_sockets: timeout_secs defaults to null, an explicit per-endpoint override round-trips" {
