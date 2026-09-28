@@ -1584,6 +1584,7 @@ const Emitter = struct {
         "Breadcrumbs", "Menu",          "MenuBar",         "Table",     "Tree",
         "Window",    "Dialog",          "ToastStack",      "Tabs",      "TabPanel",
         "AccordionSection", "Card",     "Popover",         "Tooltip",   "DateTimePicker",
+        "Canvas",
     };
 
     fn isBuiltinWidgetKind(tag: []const u8) bool {
@@ -2217,6 +2218,17 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateSpinner(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+        } else if (std.mem.eql(u8, el.tag, "Canvas")) {
+            // Drawn from Go (`Draw`, usually inside `onResize`), never from
+            // markup, so it takes no children. Sized like Table: a canvas
+            // has no content for Fit to measure, so it needs a real default.
+            try self.rejectChildren(el);
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = .{ .kind = .grow, .value = 0 }, .height = fixedSizing(240) }, layout_style), style_names);
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateCanvas(");
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "Panel")) {
@@ -5479,6 +5491,47 @@ test "<Badge tone={...}>label</Badge> forwards tone then the label" {
     const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n  <Badge tone={widgets.BadgeTonePrimary}>New</Badge>\n}\n");
     try std.testing.expect(r.err == null);
     try std.testing.expect(std.mem.indexOf(u8, r.generated.?, "widgets.CreateBadge(Badge0Layout, widgets.BadgeTonePrimary, \"New\")") != null);
+}
+
+test "<Canvas> binds ref, onResize and onClick, and rejects children" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n    <Canvas ref={&chart} onResize={redraw} onClick={pick} />\n}\n");
+    try std.testing.expect(r.err == null);
+    const gen = r.generated.?;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateCanvas(Canvas0Layout)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "chart = &Canvas0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Canvas0.OnResize(redraw)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Canvas0.OnClick(pick)") != null);
+
+    const bad = try testGenerated(arena.allocator(), "expose Foo\n\nfunc Foo(parent widgets.Container) error {\n    <Canvas><Label>x</Label></Canvas>\n}\n");
+    try std.testing.expect(bad.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad.err.?.message, "<Canvas> doesn't accept children") != null);
+}
+
+// "Canvas" must be in `builtin_widget_kinds`, not just have an emit branch:
+// that list is what lets a `<%...%>` block recognise the tag at all.
+test "<Canvas/> inside a <%...%> block is spliced as a real widget, not left as code" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Container>
+        \\    <%
+        \\      for range charts {
+        \\        <Canvas />
+        \\      }
+        \\    %>
+        \\  </Container>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, false);
+    try std.testing.expect(result.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.CreateCanvas(Canvas1Layout)") != null);
 }
 
 test "<Spinner/> takes no args and rejects children" {
