@@ -171,17 +171,23 @@ pub const Output = struct {
     struct_backed_snapshot_entries: []const StructBackedSnapshotEntry = &.{},
 };
 
-/// One auto-generated or escape-hatch-driven binding site, collected
-/// during `emitElement`'s per-attribute loop and consumed once, at the end
-/// of `generateGo`, to emit that site's rebind function (only ever
+/// One event attribute's handler, e.g. `onClick={handleSave}`.
+pub const BoundHandler = struct {
+    attr_name: []const u8,
+    handler_name: []const u8,
+};
+
+/// One auto-generated or escape-hatch-driven binding site, collected once
+/// per tag by `emitElement` (after its attribute loop) and consumed once,
+/// at the end of `generateGo`, to emit that site's rebind function (only ever
 /// populated for the "safe auto" case -- see `emitElement`'s own hook;
 /// `bindKind=`/`bindArgs=` sites supply their own hand-written rebind
 /// function and never appear here).
 pub const PendingRebind = struct {
     kind: []const u8,
     widget_tag: []const u8,
-    attr_name: []const u8,
-    handler_name: []const u8,
+    /// Every handler on the tag, reattached by the one rebind function.
+    handlers: []const BoundHandler,
     /// Raw expression text for a struct-backed kind's extra `WrapX`
     /// argument(s) -- tier-1's own creation-time attribute re-spliced
     /// verbatim (e.g. Dropdown's `options=`), or, for tier 2/3, the
@@ -1103,17 +1109,20 @@ const Emitter = struct {
         return ident.len == expr.len;
     }
 
-    /// Part 2 (codegen automation): always emits the
+    /// Part 2 (codegen automation): always emits the one
     /// `natyv.RegisterBinding(<id-expr>, "<kind>", <args-expr>)` call for
-    /// an event-attributed widget -- mechanical regardless of whether the
-    /// handler is a bare function, a composer-param closure, or a closure
+    /// an event-attributed widget, covering every handler on the tag (the
+    /// binding registry keeps one binding per widget id) -- mechanical
+    /// regardless of whether the handler is a bare function, a
+    /// composer-param closure, or a closure
     /// literal, since it only needs the widget's own id-expression and a
     /// kind/args pair (auto-derived here; `bindKind=`/`bindArgs=`, when
     /// present, override both -- see `emitElement`'s own handling of
     /// those two attributes). Separately classifies whether a full rebind
     /// function can *also* be auto-generated (`isSafeToResplice`, bare
-    /// identifier only) and, if so, queues a `PendingRebind` -- consumed
-    /// once, at the end of `generateGo`, to actually emit it.
+    /// identifier only, for every handler) and, if so, queues a
+    /// `PendingRebind` -- consumed once, at the end of `generateGo`, to
+    /// actually emit it.
     ///
     /// `id_expr` is the caller's own already-resolved id-expression
     /// (`var_name.ID()` for a struct-backed kind, `uint32(var_name)`
@@ -1132,8 +1141,15 @@ const Emitter = struct {
     /// creation-time attributes, for a tier-2/3 kind). `wrap_returns_error`
     /// (see `PendingRebind`'s own doc comment) is only ever true for a
     /// tier-2/3 `rebind_extra_args` built by `tier23ExtraWrapArgs`.
-    fn emitAutoBinding(self: *Emitter, var_name: []const u8, tag: []const u8, attr_name: []const u8, handler_expr: []const u8, id_expr: []const u8, bind_kind_override: ?[]const u8, bind_args_override: ?[]const u8, rebind_extra_args: ?[]const []const u8, wrap_returns_error: bool) EmitError!void {
-        const kind = bind_kind_override orelse try std.fmt.allocPrint(self.allocator, "gen_{s}_{s}_{s}", .{ self.composer_name, var_name, attr_name });
+    fn emitAutoBinding(self: *Emitter, var_name: []const u8, tag: []const u8, handlers: []const BoundHandler, id_expr: []const u8, bind_kind_override: ?[]const u8, bind_args_override: ?[]const u8, rebind_extra_args: ?[]const []const u8, wrap_returns_error: bool) EmitError!void {
+        const kind = bind_kind_override orelse blk: {
+            // gen_<Composer>_<var>_<attr>[_<attr>...]: a single-handler
+            // tag's kind names its one event.
+            var name: std.ArrayList(u8) = .empty;
+            try name.print(self.allocator, "gen_{s}_{s}", .{ self.composer_name, var_name });
+            for (handlers) |h| try name.print(self.allocator, "_{s}", .{h.attr_name});
+            break :blk try name.toOwnedSlice(self.allocator);
+        };
         const args_expr = bind_args_override orelse "nil";
         try self.out.appendSlice(self.allocator, "\tif err := natyv.RegisterBinding(");
         try self.out.appendSlice(self.allocator, id_expr);
@@ -1151,16 +1167,16 @@ const Emitter = struct {
         if (bind_kind_override != null) return;
         const extra_args = rebind_extra_args orelse return;
 
-        if (isBareIdentifierExpr(handler_expr) and isSafeToResplice(handler_expr, self.composer_params, self.composer_raw_code_locals)) {
-            try self.pending_rebinds.append(self.allocator, .{
-                .kind = kind,
-                .widget_tag = tag,
-                .attr_name = attr_name,
-                .handler_name = handler_expr,
-                .extra_wrap_args = extra_args,
-                .wrap_returns_error = wrap_returns_error,
-            });
+        for (handlers) |h| {
+            if (!isBareIdentifierExpr(h.handler_name) or !isSafeToResplice(h.handler_name, self.composer_params, self.composer_raw_code_locals)) return;
         }
+        try self.pending_rebinds.append(self.allocator, .{
+            .kind = kind,
+            .widget_tag = tag,
+            .handlers = handlers,
+            .extra_wrap_args = extra_args,
+            .wrap_returns_error = wrap_returns_error,
+        });
     }
 
     /// Part 2 (codegen automation), tier-1 struct-backed resplice (§3.5):
@@ -2725,6 +2741,12 @@ const Emitter = struct {
             }
         }
         var bind_kind_consumed = false;
+        // Every event attribute on this tag, bound as one unit after the
+        // attribute loop: the binding registry keeps one binding per
+        // widget id, so a tag with two handlers (a Canvas's onResize and
+        // onClick) registered separately would keep only the last one
+        // across a recycle.
+        var event_handlers: std.ArrayList(BoundHandler) = .empty;
 
         // Part 2 (codegen automation), tier-2/3 struct-backed accessor
         // wiring: resolved once, up front, same "markup attribute order
@@ -2869,42 +2891,40 @@ const Emitter = struct {
                     // `onClick={handleSave}`, not `onClick`'s.
                     .expr => |ex| {
                         try self.emitEventBinding(var_name, attr.name, ex.expr, ex.line, ex.col);
-                        // Part 2 (codegen automation): RegisterBinding is
-                        // always mechanical regardless of struct-backed-
-                        // ness, so it fires for every kind. A full rebind
-                        // function is a separate decision -- non-struct-
-                        // backed kinds always attempt one (zero extra
-                        // args); tier-1 struct-backed kinds (Dropdown/
-                        // Combobox/Menu) attempt one with their own extra
-                        // WrapX argument when it's safe to resplice; tier-
-                        // 2/3 kinds (MenuBar/Dialog/Breadcrumbs/
-                        // DateTimePicker/Table/Tree) attempt one via the
-                        // pre-scanned `tier23_target_name`/`tier23_spec`
-                        // above, referencing the already-restored
-                        // accessor-value var(s) `natyv_generated.go` will
-                        // populate (never calling the live accessor here --
-                        // see `tier23ExtraWrapArgs`'s own doc comment).
-                        if (self.recycle_enabled) {
-                            bind_kind_consumed = bind_kind_override != null;
-                            const id_expr = if (isStructBackedWidgetKind(el.tag))
-                                try std.fmt.allocPrint(self.allocator, "{s}.ID()", .{var_name})
-                            else
-                                try std.fmt.allocPrint(self.allocator, "uint32({s})", .{var_name});
-                            const rebind_extra_args: ?[]const []const u8 = if (tier23_spec) |spec|
-                                try self.tier23ExtraWrapArgs(el, tier23_target_name.?, spec)
-                            else if (isStructBackedWidgetKind(el.tag))
-                                try self.tier1ExtraWrapArgs(el)
-                            else
-                                &.{};
-                            const wrap_returns_error = if (tier23_spec) |spec| spec.wrap_returns_error else false;
-                            try self.emitAutoBinding(var_name, el.tag, attr.name, ex.expr, id_expr, bind_kind_override, bind_args_override, rebind_extra_args, wrap_returns_error);
-                        }
+                        try event_handlers.append(self.allocator, .{ .attr_name = attr.name, .handler_name = ex.expr });
                     },
                     else => return self.fail(attr.line, attr.col, "'{s}' must be a real handler expression, e.g. {s}={{handleX}}", .{ attr.name, attr.name }),
                 }
             } else {
                 return self.fail(attr.line, attr.col, "attribute '{s}' isn't supported yet", .{attr.name});
             }
+        }
+        // Part 2 (codegen automation): RegisterBinding is always
+        // mechanical regardless of struct-backed-ness, so it fires for
+        // every kind. A full rebind function is a separate decision --
+        // non-struct-backed kinds always attempt one (zero extra args);
+        // tier-1 struct-backed kinds (Dropdown/Combobox/Menu) attempt one
+        // with their own extra WrapX argument when it's safe to resplice;
+        // tier-2/3 kinds (MenuBar/Dialog/Breadcrumbs/DateTimePicker/Table/
+        // Tree) attempt one via the pre-scanned `tier23_target_name`/
+        // `tier23_spec` above, referencing the already-restored accessor-
+        // value var(s) `natyv_generated.go` will populate (never calling
+        // the live accessor here -- see `tier23ExtraWrapArgs`'s own doc
+        // comment).
+        if (self.recycle_enabled and event_handlers.items.len > 0) {
+            bind_kind_consumed = bind_kind_override != null;
+            const id_expr = if (isStructBackedWidgetKind(el.tag))
+                try std.fmt.allocPrint(self.allocator, "{s}.ID()", .{var_name})
+            else
+                try std.fmt.allocPrint(self.allocator, "uint32({s})", .{var_name});
+            const rebind_extra_args: ?[]const []const u8 = if (tier23_spec) |spec|
+                try self.tier23ExtraWrapArgs(el, tier23_target_name.?, spec)
+            else if (isStructBackedWidgetKind(el.tag))
+                try self.tier1ExtraWrapArgs(el)
+            else
+                &.{};
+            const wrap_returns_error = if (tier23_spec) |spec| spec.wrap_returns_error else false;
+            try self.emitAutoBinding(var_name, el.tag, try event_handlers.toOwnedSlice(self.allocator), id_expr, bind_kind_override, bind_args_override, rebind_extra_args, wrap_returns_error);
         }
         if (bind_kind_override != null and !bind_kind_consumed) {
             return self.fail(el.line, el.col, "'{s}' has bindKind= but no event-handler attribute (e.g. onClick=) on the same tag -- bindKind=/bindArgs= only make sense alongside a real handler attribute", .{el.tag});
@@ -3208,9 +3228,13 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
             // Table/Tree's WrapX returns (T, error) -- every other WrapX
             // in this SDK, tier-1 struct-backed kinds included, returns a
             // bare value chainable directly. See
-            // `PendingRebind.wrap_returns_error`'s own doc comment.
+            // `PendingRebind.wrap_returns_error`'s own doc comment. A tag
+            // with several handlers wraps once into `w` and binds each.
+            const chained = !pr.wrap_returns_error and pr.handlers.len == 1;
             if (pr.wrap_returns_error) {
                 try body.appendSlice(allocator, "w, err := widgets.Wrap");
+            } else if (!chained) {
+                try body.appendSlice(allocator, "w := widgets.Wrap");
             } else {
                 try body.appendSlice(allocator, "widgets.Wrap");
             }
@@ -3222,15 +3246,17 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
             }
             try body.appendSlice(allocator, ")");
             if (pr.wrap_returns_error) {
-                try body.appendSlice(allocator, "\n\tif err != nil {\n\t\treturn err\n\t}\n\tw.On");
-            } else {
-                try body.appendSlice(allocator, ".On");
+                try body.appendSlice(allocator, "\n\tif err != nil {\n\t\treturn err\n\t}");
             }
-            try body.append(allocator, pr.attr_name[2]);
-            try body.appendSlice(allocator, pr.attr_name[3..]);
-            try body.appendSlice(allocator, "(");
-            try body.appendSlice(allocator, pr.handler_name);
-            try body.appendSlice(allocator, ")\n\treturn nil\n}\n");
+            for (pr.handlers) |h| {
+                try body.appendSlice(allocator, if (chained) ".On" else "\n\tw.On");
+                try body.append(allocator, h.attr_name[2]);
+                try body.appendSlice(allocator, h.attr_name[3..]);
+                try body.appendSlice(allocator, "(");
+                try body.appendSlice(allocator, h.handler_name);
+                try body.appendSlice(allocator, ")");
+            }
+            try body.appendSlice(allocator, "\n\treturn nil\n}\n");
         }
         try body.appendSlice(allocator, "\nfunc init() {\n");
         for (pending_rebinds.items) |pr| {
@@ -3353,6 +3379,60 @@ test "recycle_enabled: a bare-function onClick auto-generates RegisterBinding, a
     try std.testing.expect(std.mem.indexOf(u8, gen, "if err := natyv.RegisterBinding(uint32(Button0), \"gen_Toolbar_Button0_onClick\", nil); err != nil {\n\t\treturn err\n\t}") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_gen_Toolbar_Button0_onClick(widgetID uint32, args json.RawMessage) error {\n\t_ = args\n\twidgets.WrapButton(widgetID).OnClick(handleSave)\n\treturn nil\n}") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "func init() {\n\tnatyv.RegisterHandlerFunc(\"gen_Toolbar_Button0_onClick\", rebind_gen_Toolbar_Button0_onClick)\n}") != null);
+}
+
+test "recycle_enabled: a tag with two handlers gets one binding that reattaches both" {
+    // The binding registry keeps one binding per widget id, so a binding
+    // per handler would lose onResize to onClick across a recycle.
+    const src =
+        \\package main
+        \\
+        \\expose Chart
+        \\
+        \\func Chart(parent widgets.Container) error {
+        \\  <Canvas onResize={handleResize} onClick={handleClick}/>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gen, "natyv.RegisterBinding("));
+    try std.testing.expect(std.mem.indexOf(u8, gen, "if err := natyv.RegisterBinding(uint32(Canvas0), \"gen_Chart_Canvas0_onResize_onClick\", nil); err != nil {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_gen_Chart_Canvas0_onResize_onClick(widgetID uint32, args json.RawMessage) error {\n\t_ = args\n\tw := widgets.WrapCanvas(widgetID)\n\tw.OnResize(handleResize)\n\tw.OnClick(handleClick)\n\treturn nil\n}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func init() {\n\tnatyv.RegisterHandlerFunc(\"gen_Chart_Canvas0_onResize_onClick\", rebind_gen_Chart_Canvas0_onResize_onClick)\n}") != null);
+}
+
+test "recycle_enabled: a tag with one unsafe handler gets its binding but no rebind function" {
+    // A partial rebind function would silently drop the unsafe handler on
+    // resume, so none is generated -- same as a lone unsafe handler.
+    const src =
+        \\package main
+        \\
+        \\expose Chart
+        \\
+        \\func Chart(parent widgets.Container, onPick func(x, y float32) error) error {
+        \\  <Canvas onResize={handleResize} onClick={onPick}/>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const found = try Expose.findComposers(allocator, src);
+    try std.testing.expect(found.err == null);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{}, true);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "natyv.RegisterBinding(uint32(Canvas0), \"gen_Chart_Canvas0_onResize_onClick\", nil)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "func rebind_") == null);
 }
 
 test "recycle_enabled: false produces byte-identical output to before this feature existed" {
